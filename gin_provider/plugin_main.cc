@@ -36,6 +36,9 @@
 #include "gin_provider/listen_handle.h"
 #include "gin_provider/proxy_context.h"
 #include "gin_provider/proxy_progress.h"
+#include "gin_provider/scratch_pool.h"
+#include "gin_provider/wire_protocol.h"
+#include <optional>
 #include "nccl.h"
 #include "nccl_common.h"
 #include "nccl_device/net_device.h"
@@ -348,10 +351,11 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
 ncclResult_t CreateContext(void* collComm, ncclGinConfig_v13_t* config,
                            void** ginCtx,
                            ncclNetDeviceHandle_v11_t** devHandle) {
-  if (collComm == nullptr || config == nullptr || ginCtx == nullptr ||
-      devHandle == nullptr) {
+  if (collComm == nullptr || config == nullptr || ginCtx == nullptr) {
     return ncclInvalidArgument;
   }
+  // devHandle may be NULL — NCCL passes nullptr when wrapping us with its
+  // own gin_host_proxy that builds the device-visible blob itself.
   auto* cc = static_cast<CollComm*>(collComm);
 
   // Round queue depth up to the next power of two so device-side mask works.
@@ -366,24 +370,25 @@ ncclResult_t CreateContext(void* collComm, ncclGinConfig_v13_t* config,
   }
 
   auto* gpu = gctx->gpu_ctx();
-  // Allocate a devHandle blob (NCCL takes ownership via plugin->free convention,
-  // but the v13 ABI actually stores it; we use plain new and rely on
-  // destroyContext for teardown).
-  static_assert(sizeof(ncclNetDeviceHandle_v11_t) <= 256, "devHandle small");
-  auto* dh = new (std::nothrow) ncclNetDeviceHandle_v11_t{};
-  if (dh == nullptr) return ncclSystemError;
-  dh->netDeviceType = NCCL_NET_DEVICE_GIN_PROXY;
-  dh->netDeviceVersion = NCCL_NET_DEVICE_UNPACK_VERSION;
-  dh->handle = gpu->dev_view;  // device pointer
-  dh->size = sizeof(*gpu->dev_view);
-  dh->needsProxyProgress = 1;
+  // Only fill devHandle when NCCL actually wants one. In gin_host_proxy mode
+  // it passes devHandle=nullptr because NCCL builds its own device blob.
+  if (devHandle != nullptr) {
+    static_assert(sizeof(ncclNetDeviceHandle_v11_t) <= 256, "devHandle small");
+    auto* dh = new (std::nothrow) ncclNetDeviceHandle_v11_t{};
+    if (dh == nullptr) return ncclSystemError;
+    dh->netDeviceType = NCCL_NET_DEVICE_GIN_PROXY;
+    dh->netDeviceVersion = NCCL_NET_DEVICE_UNPACK_VERSION;
+    dh->handle = gpu->dev_view;
+    dh->size = sizeof(*gpu->dev_view);
+    dh->needsProxyProgress = 1;
+    *devHandle = dh;
+  }
 
   // Start the host-side proxy progress thread which will drain the GFD ring.
   // No-op until M3 wires actual dxs::Send dispatching.
   gctx->StartProgress();
 
   *ginCtx = gctx.release();
-  *devHandle = dh;
 
   LOG(INFO) << absl::StrFormat(
       "GIN CreateContext: dev=%d rank=%d nranks=%d queueDepth=%u nC=%d nS=%d",
@@ -487,22 +492,182 @@ ncclResult_t CloseListen(void* listenComm) {
   return ncclSuccess;
 }
 
-ncclResult_t Iput(void*, int, uint64_t, void*, size_t, uint64_t, void*,
-                  uint32_t, void**) {
-  return ncclInternalError;  // M3
+// Per-iput request handle: holds the in-flight DXS SendOp (and an optional
+// signal SendOp for IputSignal). Test() polls them for completion.
+struct GinRequest {
+  std::unique_ptr<dxs::SendOpInterface> hdr_op;
+  std::unique_ptr<dxs::SendOpInterface> pay_op;
+  std::unique_ptr<dxs::SendOpInterface> sig_op;
+  CollComm* coll = nullptr;
+  uint32_t  scratch_slot = UINT32_MAX;
+};
+
+// Lazily-resolved offsets used to find a free TX scratch slot per peer.
+static thread_local uint32_t tls_tx_seq[64] = {0};
+
+static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
+                               uint64_t srcOff, void* srcMhandle, size_t size,
+                               uint64_t dstOff, void* dstMhandle,
+                               uint32_t rank, void** request,
+                               WireOp wire_op, uint64_t signal_off,
+                               uint32_t signal_id, uint64_t signal_val,
+                               uint32_t signal_op_arg) {
+  if (ginCtx == nullptr || request == nullptr) {
+    LOG(ERROR) << "IputCommon: ginCtx or request null";
+    return ncclInvalidArgument;
+  }
+  auto* gctx = static_cast<GinCtx*>(ginCtx);
+  auto* cc = gctx->coll();
+  auto* sp = gctx->scratch();
+  if (cc == nullptr || sp == nullptr) {
+    LOG(ERROR) << "IputCommon: coll or scratch null";
+    return ncclInternalError;
+  }
+
+  // NCCL gin_host_proxy passes `rank` as the index into the peer mesh after
+  // self has been removed from the list — i.e. for my_rank=K and target
+  // logical rank L, the global rank is L if L<K else L+1.
+  int my_rank = cc->rank();
+  int global_rank = static_cast<int>(rank);
+  if (global_rank >= my_rank) global_rank += 1;
+  PeerConn* peer = cc->peer(global_rank);
+  if (peer == nullptr || peer->send_sock == nullptr) {
+    LOG(ERROR) << "IputCommon: bad peer logical_rank=" << rank
+               << " global_rank=" << global_rank
+               << " my_rank=" << my_rank
+               << " num_peers=" << cc->num_peers();
+    return ncclInvalidArgument;
+  }
+  uint64_t src_key = reinterpret_cast<uint64_t>(srcMhandle);
+  uint64_t dst_key = reinterpret_cast<uint64_t>(dstMhandle);
+  MemHandle* src_mh = cc->lookup_memhandle(src_key);
+  if (size > 0 && wire_op != kWireOpSignal && wire_op != kWireOpFlush
+      && (src_mh == nullptr || src_mh->local_reg == 0)) {
+    LOG(ERROR) << "IputCommon: bad src_mh key=0x" << std::hex << src_key
+               << " size=" << std::dec << size << " wire_op=" << wire_op;
+    return ncclInvalidArgument;
+  }
+
+  WireHeader hdr{};
+  hdr.magic = kWireMagic;
+  hdr.op = static_cast<uint16_t>(wire_op);
+  hdr.source_rank = static_cast<uint32_t>(cc->rank());
+  hdr.dest_rank = rank;
+  hdr.dst_handle = dst_key;
+  hdr.dst_off = dstOff;
+  hdr.size = size;
+  hdr.signal_val = signal_val;
+  hdr.signal_id = signal_id;
+  (void)signal_off;
+  (void)signal_op_arg;
+
+  // Stage header in TX scratch for this peer.
+  uint32_t slot_idx =
+      tls_tx_seq[rank % 64]++ & static_cast<uint32_t>(kTxSlotsPerPeer - 1);
+  size_t hdr_off = sp->TxSlotOffset(static_cast<int>(rank), slot_idx);
+
+  // The NCCL proxy thread may be on a different CUDA context; ensure we use
+  // device 0 (matches scratch_pool's cudaMalloc) and clear any sticky error
+  // from a prior async kernel before issuing our own copy.
+  static thread_local bool tls_cuda_inited = false;
+  if (!tls_cuda_inited) {
+    cudaSetDevice(0);
+    cudaGetLastError();  // swallow stale error
+    tls_cuda_inited = true;
+  }
+
+  cudaError_t cerr = cudaMemcpy(
+      static_cast<uint8_t*>(sp->device_ptr) + hdr_off, &hdr, sizeof(hdr),
+      cudaMemcpyHostToDevice);
+  if (cerr != cudaSuccess) {
+    LOG(ERROR) << "IputCommon: cudaMemcpy failed: "
+               << cudaGetErrorString(cerr);
+    return ncclInternalError;
+  }
+
+  auto req = std::make_unique<GinRequest>();
+  req->coll = cc;
+  req->scratch_slot = slot_idx;
+
+  auto hdr_or = peer->send_sock->Send(hdr_off, sizeof(WireHeader),
+                                      sp->reg_handle);
+  if (!hdr_or.ok()) {
+    LOG(ERROR) << "IputCommon: header Send failed: " << hdr_or.status();
+    return ncclInternalError;
+  }
+  req->hdr_op = std::move(*hdr_or);
+
+  if (size > 0 && wire_op != kWireOpSignal && wire_op != kWireOpFlush) {
+    if (src_mh == nullptr || src_mh->local_reg == 0) {
+      LOG(ERROR) << "IputCommon: src_mh missing for size=" << size;
+      return ncclInvalidArgument;
+    }
+    auto pay_or = peer->send_sock->Send(srcOff, size, src_mh->local_reg);
+    if (!pay_or.ok()) {
+      LOG(ERROR) << "IputCommon: payload Send failed: " << pay_or.status();
+      return ncclInternalError;
+    }
+    req->pay_op = std::move(*pay_or);
+  }
+
+  *request = req.release();
+  return ncclSuccess;
 }
-ncclResult_t IputSignal(void*, int, uint64_t, void*, size_t, uint64_t, void*,
-                        uint32_t, uint64_t, void*, uint64_t, uint32_t, void**) {
-  return ncclInternalError;  // M3
+
+ncclResult_t Iput(void* ginCtx, int context, uint64_t srcOff, void* srcMhandle,
+                  size_t size, uint64_t dstOff, void* dstMhandle,
+                  uint32_t rank, void** request) {
+  return IputCommon(ginCtx, context, srcOff, srcMhandle, size, dstOff,
+                    dstMhandle, rank, request, kWireOpPut, 0, 0, 0, 0);
 }
-ncclResult_t Iget(void*, int, uint64_t, void*, size_t, uint64_t, void*,
-                  uint32_t, void**) {
-  return ncclInternalError;  // M3
+
+ncclResult_t IputSignal(void* ginCtx, int context, uint64_t srcOff,
+                        void* srcMhandle, size_t size, uint64_t dstOff,
+                        void* dstMhandle, uint32_t rank, uint64_t signalOff,
+                        void* /*signalMhandle*/, uint64_t signalValue,
+                        uint32_t signalOp, void** request) {
+  return IputCommon(ginCtx, context, srcOff, srcMhandle, size, dstOff,
+                    dstMhandle, rank, request, kWireOpPutSignal, signalOff,
+                    /*signal_id=*/0, signalValue, signalOp);
 }
-ncclResult_t Iflush(void*, int, void*, uint32_t, void**) {
-  return ncclInternalError;  // M3
+
+ncclResult_t Iget(void* ginCtx, int context, uint64_t remoteOff,
+                  void* remoteMhandle, size_t size, uint64_t localOff,
+                  void* localMhandle, uint32_t rank, void** request) {
+  // Stub: emit a Get header; receiver-side Get reply not yet implemented.
+  return IputCommon(ginCtx, context, /*srcOff=*/0, /*srcMhandle=*/localMhandle,
+                    /*size=*/0, remoteOff, remoteMhandle, rank, request,
+                    kWireOpGet, 0, 0, 0, 0);
 }
-ncclResult_t Test(void*, void*, int*) { return ncclInternalError; /* M3 */ }
+
+ncclResult_t Iflush(void* ginCtx, int context, void* mhandle, uint32_t rank,
+                    void** request) {
+  return IputCommon(ginCtx, context, 0, mhandle, 0, 0, mhandle, rank, request,
+                    kWireOpFlush, 0, 0, 0, 0);
+}
+
+ncclResult_t Test(void* /*collComm*/, void* request, int* done) {
+  if (request == nullptr || done == nullptr) return ncclInvalidArgument;
+  auto* req = static_cast<GinRequest*>(request);
+  *done = 0;
+
+  auto poll = [](dxs::SendOpInterface* op) -> std::optional<ncclResult_t> {
+    if (op == nullptr) return ncclSuccess;
+    auto s = op->Test();
+    if (!s.has_value()) return std::nullopt;
+    if (!s->ok()) return ncclInternalError;
+    return ncclSuccess;
+  };
+
+  for (auto* op : {req->hdr_op.get(), req->pay_op.get(), req->sig_op.get()}) {
+    auto r = poll(op);
+    if (!r.has_value()) return ncclSuccess;  // not done
+    if (*r != ncclSuccess) return *r;
+  }
+  *done = 1;
+  delete req;
+  return ncclSuccess;
+}
 
 ncclResult_t GinProgress(void* ginCtx) {
   if (ginCtx != nullptr) {
