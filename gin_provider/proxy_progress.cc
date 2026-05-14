@@ -275,7 +275,7 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
       continue;
     }
     static std::atomic<int> rx_dbg{0};
-    if (rx_dbg.fetch_add(1) < 8) {
+    if (rx_dbg.fetch_add(1) < 50) {
       LOG(INFO) << "RunInbound DBG #" << rx_dbg.load()
                 << " op=" << hdr.op << " src=" << hdr.source_rank
                 << " dst=" << hdr.dest_rank << " size=" << hdr.size
@@ -308,6 +308,13 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           if (!p_sz.ok()) {
             LOG(ERROR) << "RunInbound: payload recv wait: " << p_sz.status();
             break;
+          }
+          static std::atomic<int> pl_dbg{0};
+          if (pl_dbg.fetch_add(1) < 16) {
+            LOG(INFO) << "RunInbound payload OK off=" << hdr.dst_off
+                      << " size=" << hdr.size << " got=" << *p_sz
+                      << " dst_handle=0x" << std::hex << hdr.dst_handle
+                      << std::dec;
           }
         }
         if (hdr.op == kWireOpPutSignal) {

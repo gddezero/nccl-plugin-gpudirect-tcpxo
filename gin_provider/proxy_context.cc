@@ -55,16 +55,60 @@ PeerConn* CollComm::peer(int peer_rank) {
 
 uint64_t CollComm::register_memhandle(MemHandle h) {
   absl::MutexLock l(&mh_mu_);
-  uint64_t key = next_mh_key_++;
-  memhandles_.emplace(key, std::move(h));
+  // Use ordinal (registration sequence) as the key. Both ranks invoke
+  // regMrSym in the same logical order for the same set of buffers within
+  // a CollComm (NCCL's symmetric memory init is deterministic, and DeepEP
+  // calls pp/dispatch buffer registration symmetrically across ranks), so
+  // ordinal N on rank A maps to the corresponding buffer registered as
+  // ordinal N on rank B.  This avoids the need to OOB-exchange peer
+  // mhandles for non-symmetric (separately cudaMalloc'd) buffers like the
+  // ElasticBuffer pp scratch (different VA per rank).
+  // Shift by 1 to leave bit 0 free (NCCL packs srcHandle/dstHandle as a
+  // 63-bit field with bit 0 used as a flag).
+  uint64_t key = (next_mh_key_++) << 1;
+  void* base = h.base;
+  size_t bytes = h.bytes;
+  uint64_t local_reg = h.local_reg;
+  memhandles_.insert_or_assign(key, std::move(h));
+  static std::atomic<int> reg_dbg{0};
+  if (reg_dbg.fetch_add(1) < 32) {
+    LOG(INFO) << "register_memhandle: rank=" << rank_
+              << " key=0x" << std::hex << key
+              << " base=" << base
+              << " bytes=" << std::dec << bytes
+              << " local_reg=" << local_reg
+              << " total_keys=" << memhandles_.size();
+  }
   return key;
 }
 
 MemHandle* CollComm::lookup_memhandle(uint64_t key) {
   absl::MutexLock l(&mh_mu_);
   auto it = memhandles_.find(key);
-  if (it == memhandles_.end()) return nullptr;
-  return &it->second;
+  if (it != memhandles_.end()) return &it->second;
+  // Range-based fallback: NCCL may pass a pointer INTO a registered region
+  // (e.g. base + offset), not the exact base. Find an entry whose
+  // [base, base + bytes) contains `key`.
+  for (auto& kv : memhandles_) {
+    uint64_t base_k = kv.first;
+    uint64_t end_k = base_k + kv.second.bytes;
+    if (key >= base_k && key < end_k) return &kv.second;
+  }
+  static std::atomic<int> lk_dbg{0};
+  if (lk_dbg.fetch_add(1) < 16) {
+    LOG(WARNING) << "lookup_memhandle MISS rank=" << rank_
+                 << " key=0x" << std::hex << key
+                 << " (decimal=" << std::dec << key << ")"
+                 << " known_keys=" << memhandles_.size();
+    int n = 0;
+    for (auto& kv : memhandles_) {
+      if (n++ >= 8) { LOG(WARNING) << "  ... more keys omitted"; break; }
+      LOG(WARNING) << "  known: key=0x" << std::hex << kv.first
+                   << " base=" << kv.second.base
+                   << " bytes=" << std::dec << kv.second.bytes;
+    }
+  }
+  return nullptr;
 }
 
 void CollComm::erase_memhandle(uint64_t key) {

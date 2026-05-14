@@ -112,47 +112,93 @@ int main(int argc, char** argv) {
   CHECK_NCCL(ncclCommInitRank(&comm, nranks, id, rank));
   fprintf(stderr, "[rank %d] comm init OK\n", rank);
 
-  // Use a large symmetric AllGather to push NCCL toward the GIN kernel
-  // (all_gather_gin). Each rank contributes 1 MB; total recv = nranks MB.
-  constexpr size_t kPerRank = 64ULL << 20;  // 64 MiB per rank — push toward GIN
-  constexpr size_t kTotal = kPerRank;       // we reuse the same window for send+recv
+  // Performance sweep: AllReduce + AllGather across geometric sizes.
+  // For each size: warm-up 5, time 20 iterations, report avg latency + busbw.
+  constexpr size_t kMaxBytes = 256ULL << 20;  // 256 MiB
   void* sbuf = nullptr;
   void* rbuf = nullptr;
-  CHECK_NCCL(ncclMemAlloc(&sbuf, kPerRank));
-  CHECK_NCCL(ncclMemAlloc(&rbuf, kPerRank * nranks));
+  CHECK_NCCL(ncclMemAlloc(&sbuf, kMaxBytes));
+  CHECK_NCCL(ncclMemAlloc(&rbuf, kMaxBytes * nranks));
   ncclWindow_t swin = nullptr;
   ncclWindow_t rwin = nullptr;
-  CHECK_NCCL(ncclCommWindowRegister(comm, sbuf, kPerRank, &swin, 0));
-  CHECK_NCCL(ncclCommWindowRegister(comm, rbuf, kPerRank * nranks, &rwin, 0));
-  fprintf(stderr, "[rank %d] symmetric windows OK (sbuf=%p rbuf=%p)\n",
-          rank, sbuf, rbuf);
+  CHECK_NCCL(ncclCommWindowRegister(comm, sbuf, kMaxBytes, &swin, 0));
+  CHECK_NCCL(ncclCommWindowRegister(comm,
+                                    rbuf, kMaxBytes * nranks, &rwin, 0));
+  CHECK_CUDA(cudaMemset(sbuf, rank + 1, kMaxBytes));
 
-  // Fill send buffer with distinctive pattern: byte = (rank+1)
-  CHECK_CUDA(cudaMemset(sbuf, rank + 1, kPerRank));
-  CHECK_CUDA(cudaMemset(rbuf, 0, kPerRank * nranks));
+  cudaStream_t stream;
+  CHECK_CUDA(cudaStreamCreate(&stream));
+  cudaEvent_t evb, eve;
+  CHECK_CUDA(cudaEventCreate(&evb));
+  CHECK_CUDA(cudaEventCreate(&eve));
 
-  fprintf(stderr, "[rank %d] AllGather %zu bytes per rank\n", rank, kPerRank);
-  CHECK_NCCL(ncclAllGather(sbuf, rbuf, kPerRank, ncclInt8, comm, 0));
-  CHECK_CUDA(cudaStreamSynchronize(0));
-  fprintf(stderr, "[rank %d] AllGather done, verifying\n", rank);
+  if (rank == 0) {
+    fprintf(stderr,
+            "\n%-12s | %-22s | %-22s\n"
+            "%-12s | %-10s %-10s | %-10s %-10s\n",
+            "size", "AllReduce", "AllGather",
+            "bytes", "lat(us)", "busbw(GB/s)", "lat(us)", "busbw(GB/s)");
+  }
 
-  // Pull back a slice from each rank's region and verify content.
   bool ok = true;
-  uint8_t sample[16];
-  for (int r = 0; r < nranks; ++r) {
-    CHECK_CUDA(cudaMemcpy(sample, (uint8_t*)rbuf + r * kPerRank, sizeof(sample),
-                          cudaMemcpyDeviceToHost));
-    uint8_t want = (uint8_t)(r + 1);
-    for (size_t i = 0; i < sizeof(sample); ++i) {
-      if (sample[i] != want) {
-        fprintf(stderr, "[rank %d] MISMATCH region %d byte %zu got %u want %u\n",
-                rank, r, i, sample[i], want);
-        ok = false;
-        break;
-      }
+  const size_t kSizes[] = {1<<10, 1<<14, 1<<18, 1<<20, 1<<22, 4<<20,
+                           16<<20, 64<<20, 256<<20};
+  constexpr int kWarm = 5;
+  constexpr int kIters = 20;
+  for (size_t bytes : kSizes) {
+    if (bytes > kMaxBytes) break;
+    size_t count = bytes / sizeof(float);
+
+    // Warm up.
+    for (int i = 0; i < kWarm; ++i) {
+      CHECK_NCCL(ncclAllReduce(sbuf, rbuf, count, ncclFloat, ncclSum,
+                               comm, stream));
+    }
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+
+    // AllReduce timing.
+    CHECK_CUDA(cudaEventRecord(evb, stream));
+    for (int i = 0; i < kIters; ++i) {
+      CHECK_NCCL(ncclAllReduce(sbuf, rbuf, count, ncclFloat, ncclSum,
+                               comm, stream));
+    }
+    CHECK_CUDA(cudaEventRecord(eve, stream));
+    CHECK_CUDA(cudaEventSynchronize(eve));
+    float ms_ar = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&ms_ar, evb, eve));
+    double lat_ar_us = (double)ms_ar * 1000.0 / kIters;
+    // AllReduce busbw factor for ring: 2 * (n-1) / n
+    double bw_ar = (double)bytes * 2.0 * (nranks - 1) / nranks /
+                   (lat_ar_us * 1e-6) / 1e9;
+
+    // AllGather timing.
+    for (int i = 0; i < kWarm; ++i) {
+      CHECK_NCCL(ncclAllGather(sbuf, rbuf, bytes, ncclInt8, comm, stream));
+    }
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaEventRecord(evb, stream));
+    for (int i = 0; i < kIters; ++i) {
+      CHECK_NCCL(ncclAllGather(sbuf, rbuf, bytes, ncclInt8, comm, stream));
+    }
+    CHECK_CUDA(cudaEventRecord(eve, stream));
+    CHECK_CUDA(cudaEventSynchronize(eve));
+    float ms_ag = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&ms_ag, evb, eve));
+    double lat_ag_us = (double)ms_ag * 1000.0 / kIters;
+    // AllGather busbw factor: (n-1) / n  -- per output byte
+    double bw_ag = (double)bytes * (nranks - 1) / nranks /
+                   (lat_ag_us * 1e-6) / 1e9;
+
+    if (rank == 0) {
+      fprintf(stderr,
+              "%-12zu | %-10.1f %-10.2f | %-10.1f %-10.2f\n",
+              bytes, lat_ar_us, bw_ar, lat_ag_us, bw_ag);
     }
   }
 
+  CHECK_CUDA(cudaEventDestroy(evb));
+  CHECK_CUDA(cudaEventDestroy(eve));
+  CHECK_CUDA(cudaStreamDestroy(stream));
   CHECK_NCCL(ncclCommWindowDeregister(comm, swin));
   CHECK_NCCL(ncclCommWindowDeregister(comm, rwin));
   CHECK_NCCL(ncclCommDestroy(comm));

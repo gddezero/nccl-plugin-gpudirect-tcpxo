@@ -561,7 +561,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   auto* cc = gctx->coll();
   auto* sp = gctx->scratch();
   static std::atomic<int> dbg_count{0};
-  if (dbg_count.fetch_add(1) < 8) {
+  if (dbg_count.fetch_add(1) < 50) {
     LOG(INFO) << "IputCommon DBG #" << dbg_count.load()
               << " op=" << wire_op << " rank=" << rank
               << " size=" << size << " sig_off=" << signal_off
@@ -731,12 +731,49 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
       LOG(ERROR) << "IputCommon: src_mh missing for size=" << size;
       return ncclInvalidArgument;
     }
+    static std::atomic<int> ppr{0};
+    if (ppr.fetch_add(1) < 8) {
+      LOG(INFO) << "IputCommon BEFORE-payload-Send peer=" << global_rank
+                << " srcOff=" << srcOff << " size=" << size
+                << " src_reg=" << src_mh->local_reg;
+    }
     auto pay_or = peer->send_sock->Send(srcOff, size, src_mh->local_reg);
+    static std::atomic<int> ppo{0};
+    if (ppo.fetch_add(1) < 8) {
+      LOG(INFO) << "IputCommon AFTER-payload-Send peer=" << global_rank
+                << " ok=" << pay_or.ok();
+    }
     if (!pay_or.ok()) {
       LOG(ERROR) << "IputCommon: payload Send failed: " << pay_or.status();
       return ncclInternalError;
     }
     req->pay_op = std::move(*pay_or);
+    {
+      auto deadline = absl::Now() + absl::Seconds(5);
+      bool done = false;
+      while (absl::Now() < deadline) {
+        auto s = req->pay_op->Test();
+        if (s.has_value()) {
+          if (!s->ok()) {
+            LOG(ERROR) << "IputCommon: payload Send op error: " << *s
+                       << " peer=" << global_rank << " size=" << size;
+            return ncclInternalError;
+          }
+          done = true;
+          break;
+        }
+        std::this_thread::yield();
+      }
+      static std::atomic<int> pl_dbg{0};
+      if (pl_dbg.fetch_add(1) < 16) {
+        LOG(INFO) << "IputCommon payload Send "
+                  << (done ? "DONE" : "TIMEOUT(5s)")
+                  << " peer=" << global_rank
+                  << " srcOff=" << srcOff
+                  << " size=" << size
+                  << " src_reg=" << src_mh->local_reg;
+      }
+    }
   }
 
   *request = req.release();
