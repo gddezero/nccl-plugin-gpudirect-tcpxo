@@ -113,7 +113,11 @@ void ProxyProgress::TickOutbound() {
   for (int p = 0; p < gpu->nranks; ++p) {
     if (p == cc->rank()) continue;
     auto* peer = cc->peer(p);
-    if (peer == nullptr || peer->send_sock == nullptr) continue;
+    if (peer == nullptr || peer->send_socks.empty()) continue;
+    // Lane 0 only — TickOutbound is the legacy GFD-ring path which PROXY
+    // mode never reaches; not worth striping.
+    auto* sock = peer->send_socks[0].get();
+    if (sock == nullptr) continue;
 
     auto* pi_atomic =
         reinterpret_cast<std::atomic<uint32_t>*>(&gpu->host_pis[p]);
@@ -181,7 +185,7 @@ void ProxyProgress::TickOutbound() {
       }
 
       // 1) Send the header.
-      auto hdr_send_or = peer->send_sock->Send(
+      auto hdr_send_or = sock->Send(
           hdr_off, sizeof(WireHeader), scratch->reg_handle);
       if (!hdr_send_or.ok()) {
         LOG(ERROR) << "TickOutbound: header Send failed: "
@@ -203,7 +207,7 @@ void ProxyProgress::TickOutbound() {
           break;
         }
         auto pay_send_or =
-            peer->send_sock->Send(dec.src_off, hdr.size, mh->local_reg);
+            sock->Send(dec.src_off, hdr.size, mh->local_reg);
         if (!pay_send_or.ok()) {
           LOG(ERROR) << "TickOutbound: payload Send failed: "
                      << pay_send_or.status();
@@ -231,12 +235,23 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
   auto* recv_sock = cc->inbound(inbound_idx);
   if (recv_sock == nullptr) return;
 
-  // Each inbound thread owns its own slot in the rx ring (round-robin).
-  size_t rx_slot = inbound_idx;
+  // M6.2: each inbound thread owns a disjoint stride of the rx slot
+  // ring so concurrent threads never DMA into the same 64B header slot.
+  // Slice = floor(kRxSlots / num_inbound), starting at inbound_idx*slice.
+  // (Per review S4: previously stride=1 caused thread 0 and thread 1 to
+  // collide on slot 1 from the second iteration.)
+  size_t num_in = cc->num_inbound();
+  if (num_in == 0) num_in = 1;
+  size_t slice = kRxSlots / num_in;
+  if (slice == 0) slice = 1;
+  size_t base = inbound_idx * slice;
+  size_t rx_local = 0;
 
   while (!stop_.load(std::memory_order_acquire)) {
+    size_t rx_slot = base + rx_local;
+    if (rx_slot >= kRxSlots) rx_slot %= kRxSlots;
     size_t rx_off = scratch->RxSlotOffset(rx_slot);
-    rx_slot = (rx_slot + 1) % kRxSlots;
+    rx_local = (rx_local + 1) % slice;
 
     auto recv_or = recv_sock->RecvLinearized(rx_off, sizeof(WireHeader),
                                              scratch->reg_handle);

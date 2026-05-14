@@ -247,10 +247,20 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
     return StatusToNccl(s);
   }
 
-  // Issue all outbound connects up front. Each peer is doing the same
-  // concurrently, so if we waited for one connect to be ready before
-  // issuing the next, we would risk deadlock during the (n*(n-1)) handshake.
-  std::vector<std::unique_ptr<dxs::SendSocketInterface>> pending(nranks);
+  // M6.2 fan-out: open `fanout` parallel sockets per peer instead of one.
+  // Each peer is doing the same concurrently; issuing them all up front
+  // before draining ready-ness avoids n*(n-1) handshake deadlocks.
+  const int fanout = FanoutPerPeer();
+  // pending[r] holds `fanout` SendSocket unique_ptrs for peer r (indices
+  // not yet ready are non-null; entries become null as they are moved into
+  // PeerConn.send_socks).
+  std::vector<std::vector<std::unique_ptr<dxs::SendSocketInterface>>> pending(
+      nranks);
+  // accumulate ready sockets per peer here, only flush into PeerConn once
+  // all `fanout` lanes for that peer have come up (set_peer takes a value).
+  std::vector<std::vector<std::unique_ptr<dxs::SendSocketInterface>>> ready(
+      nranks);
+  std::vector<int> ready_count(nranks, 0);
   for (int r = 0; r < nranks; ++r) {
     if (r == rank) continue;
     if (handles[r] == nullptr) {
@@ -273,38 +283,56 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
       LOG(ERROR) << "GIN Connect: handles[" << r << "] bad addr_family";
       return ncclInvalidArgument;
     }
-    auto sock_or = dxs->Connect(addr_str, h.port);
-    if (!sock_or.ok()) {
-      LOG(ERROR) << "GIN Connect: dxs->Connect to rank " << r << " failed: "
-                 << sock_or.status();
-      return StatusToNccl(sock_or.status());
+    pending[r].resize(fanout);
+    ready[r].reserve(fanout);
+    for (int lane = 0; lane < fanout; ++lane) {
+      auto sock_or = dxs->Connect(addr_str, h.port);
+      if (!sock_or.ok()) {
+        LOG(ERROR) << "GIN Connect: dxs->Connect lane=" << lane << " to rank "
+                   << r << " failed: " << sock_or.status();
+        return StatusToNccl(sock_or.status());
+      }
+      pending[r][lane] = std::move(*sock_or);
     }
-    pending[r] = std::move(*sock_or);
   }
 
-  // Interleaved progress loop: poll each pending outbound for ready, and
-  // poll listen->Accept(), until all outbound + (nranks-1) inbound are done.
+  // Interleaved progress loop: drain pending outbound + accept inbound
+  // until both sides have all (nranks-1) * fanout sockets.
+  const size_t inbound_target =
+      static_cast<size_t>(nranks - 1) * static_cast<size_t>(fanout);
   size_t accepted = 0;
   auto deadline = absl::Now() + absl::Seconds(120);
   while (true) {
-    // Drain pending outbound.
+    // Drain pending outbound (per peer per lane).
     for (int r = 0; r < nranks; ++r) {
-      if (pending[r] == nullptr) continue;
-      auto status = pending[r]->SocketReady();
-      if (!status.has_value()) continue;     // still pending
-      if (!status->ok()) {
-        LOG(ERROR) << "GIN Connect outbound to rank " << r
-                   << " failed: " << *status;
-        return StatusToNccl(*status);
+      if (r == rank) continue;
+      bool peer_all_done = true;
+      for (int lane = 0; lane < fanout; ++lane) {
+        if (pending[r][lane] == nullptr) continue;
+        auto status = pending[r][lane]->SocketReady();
+        if (!status.has_value()) {
+          peer_all_done = false;
+          continue;
+        }
+        if (!status->ok()) {
+          LOG(ERROR) << "GIN Connect outbound to rank " << r << " lane "
+                     << lane << " failed: " << *status;
+          return StatusToNccl(*status);
+        }
+        ready[r].push_back(std::move(pending[r][lane]));
+        pending[r][lane] = nullptr;
+        ++ready_count[r];
       }
-      PeerConn pc;
-      pc.send_sock = std::move(pending[r]);
-      cc->set_peer(r, std::move(pc));
-      pending[r] = nullptr;
+      if (peer_all_done && ready_count[r] == fanout && !ready[r].empty()) {
+        PeerConn pc;
+        pc.send_socks = std::move(ready[r]);
+        cc->set_peer(r, std::move(pc));
+        ready[r].clear();
+      }
     }
 
     // Drain inbound accepts.
-    if (accepted < static_cast<size_t>(nranks - 1)) {
+    if (accepted < inbound_target) {
       auto sock_or = lc->listen_sock->Accept();
       if (!sock_or.ok()) {
         LOG(ERROR) << "GIN Connect: listen->Accept failed: " << sock_or.status();
@@ -323,27 +351,25 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
 
     bool all_outbound_done = true;
     for (int r = 0; r < nranks; ++r) {
-      if (pending[r] != nullptr) {
+      if (r == rank) continue;
+      if (ready_count[r] != fanout) {
         all_outbound_done = false;
         break;
       }
     }
-    if (all_outbound_done &&
-        accepted >= static_cast<size_t>(nranks - 1)) {
-      break;
-    }
+    if (all_outbound_done && accepted >= inbound_target) break;
     if (absl::Now() > deadline) {
       LOG(ERROR) << "GIN Connect: handshake timed out, accepted=" << accepted
-                 << " of " << (nranks - 1);
+                 << " of " << inbound_target;
       return ncclSystemError;
     }
     std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 
   LOG(INFO) << absl::StrFormat(
-      "GIN Connect: dev=%d rank=%d/%d mesh established "
-      "(out=%d, in=%zu)",
-      lc->dev, rank, nranks, nranks - 1, accepted);
+      "GIN Connect: dev=%d rank=%d/%d mesh established (fanout=%d, "
+      "out=%d, in=%zu)",
+      lc->dev, rank, nranks, fanout, (nranks - 1) * fanout, accepted);
 
   *collComm = cc.release();
   return ncclSuccess;
@@ -668,11 +694,38 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
     return ncclSuccess;
   }
   PeerConn* peer = cc->peer(global_rank);
-  if (peer == nullptr || peer->send_sock == nullptr) {
+  if (peer == nullptr || peer->send_socks.empty()) {
     LOG(ERROR) << "IputCommon: bad peer rank=" << rank
                << " my_rank=" << my_rank
                << " num_peers=" << cc->num_peers();
     return ncclInvalidArgument;
+  }
+  // M6.2: pick a lane round-robin so successive Iputs to the same peer
+  // stripe across the per-peer socket pool. Both hdr Send and payload
+  // Send must use the SAME socket (TCP/dxs guarantees in-order on a
+  // single sock; receiver pulls hdr-then-payload off the same RecvSock).
+  //
+  // Size guard: small ops (signal/tiny payloads) are control-plane bound
+  // and benefit from co-locating on lane 0 — fan-out adds receiver-side
+  // multi-thread overhead that overwhelms the wire saving when each op
+  // is sub-millisecond on the wire. Threshold tunable via NCCL_GIN_FANOUT_MIN
+  // (default 1 MiB; small-tensor PP at 512KB stays on lane 0).
+  static const size_t kFanoutMinBytes = []() {
+    const char* v = std::getenv("NCCL_GIN_FANOUT_MIN");
+    if (v == nullptr || *v == 0) return size_t{1ull << 20};  // 1 MiB
+    long n = std::atol(v);
+    return n > 0 ? static_cast<size_t>(n) : size_t{1ull << 20};
+  }();
+  const size_t fanout = peer->send_socks.size();
+  size_t lane = 0;
+  if (size >= kFanoutMinBytes && fanout > 1) {
+    uint64_t lane_seq = peer->tx_seq.fetch_add(1, std::memory_order_relaxed);
+    lane = lane_seq % fanout;
+  }
+  dxs::SendSocketInterface* sock = peer->send_socks[lane].get();
+  if (sock == nullptr) {
+    LOG(ERROR) << "IputCommon: lane " << lane << " send_sock null";
+    return ncclInternalError;
   }
   uint64_t src_key = reinterpret_cast<uint64_t>(srcMhandle);
   uint64_t dst_key = reinterpret_cast<uint64_t>(dstMhandle);
@@ -741,8 +794,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
               << " size=" << sizeof(WireHeader)
               << " reg=" << sp->reg_handle;
   }
-  auto hdr_or = peer->send_sock->Send(hdr_off, sizeof(WireHeader),
-                                      sp->reg_handle);
+  auto hdr_or = sock->Send(hdr_off, sizeof(WireHeader), sp->reg_handle);
   static std::atomic<int> snd_post{0};
   if (snd_post.fetch_add(1) < 4) {
     LOG(INFO) << "IputCommon AFTER-Send peer=" << global_rank
@@ -789,7 +841,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
       LOG(ERROR) << "IputCommon: src_mh missing for size=" << size;
       return ncclInvalidArgument;
     }
-    auto pay_or = peer->send_sock->Send(srcOff, size, src_mh->local_reg);
+    auto pay_or = sock->Send(srcOff, size, src_mh->local_reg);
     if (!pay_or.ok()) {
       LOG(ERROR) << "IputCommon: payload Send failed: " << pay_or.status();
       return ncclInternalError;

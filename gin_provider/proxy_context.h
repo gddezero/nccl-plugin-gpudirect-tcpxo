@@ -53,10 +53,40 @@ struct ListenComm {
 };
 
 // Per-peer DXS connection inside a CollComm.
+//
+// M6.2 fan-out: each (rank, peer) keeps N parallel send sockets so a
+// single stream of pp_send / dispatch ops can be striped across multiple
+// dxs Sends in parallel. Each socket still resolves to the same NIC
+// (set by the CollComm's fastrak_idx_), so this is "multi-stream / same-
+// NIC", but it lifts the per-socket queue-depth limit and lets the dxs
+// server worker fan-out absorb pipelining the inline hdr-DONE wait can't.
+// Receivers keep one inbound thread per accepted RecvSocket — total
+// count is N*(nranks-1).
 struct PeerConn {
-  std::unique_ptr<dxs::SendSocketInterface> send_sock;
-  std::unique_ptr<dxs::RecvSocketInterface> recv_sock;
+  std::vector<std::unique_ptr<dxs::SendSocketInterface>> send_socks;
+  std::atomic<uint64_t> tx_seq{0};  // round-robin lane selector
+  PeerConn() = default;
+  PeerConn(const PeerConn&) = delete;
+  PeerConn& operator=(const PeerConn&) = delete;
+  PeerConn(PeerConn&& o) noexcept
+      : send_socks(std::move(o.send_socks)),
+        tx_seq(o.tx_seq.load(std::memory_order_relaxed)) {}
+  PeerConn& operator=(PeerConn&& o) noexcept {
+    send_socks = std::move(o.send_socks);
+    tx_seq.store(o.tx_seq.load(std::memory_order_relaxed),
+                 std::memory_order_relaxed);
+    return *this;
+  }
 };
+
+// Default fan-out per peer; can be overridden via NCCL_GIN_FANOUT env var.
+// Default 1 (= v2 behaviour, no fan-out) because each extra socket spawns a
+// dedicated inbound polling thread that adds CPU contention; small-tensor PP
+// is latency-bound and regresses sharply when CPU is divided. Bandwidth
+// workloads (>= 8 MB single payload) recover their cost — opt in via
+// NCCL_GIN_FANOUT=4 on those.
+constexpr int kDefaultFanout = 1;
+int FanoutPerPeer();
 
 // Memory registration: holds the local DXS Reg plus the array of peer Regs
 // gathered out-of-band by NCCL after RegMrSym (peer regs are stored in the

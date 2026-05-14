@@ -8,6 +8,8 @@
 
 #include "gin_provider/proxy_context.h"
 
+#include <cstdlib>
+#include <string>
 #include <utility>
 
 #include "absl/log/log.h"
@@ -18,6 +20,20 @@
 #include "gin_provider/proxy_progress.h"
 
 namespace fastrak::gin {
+
+// M6.2: env-overridable per-peer fan-out. Cached so we only parse once.
+int FanoutPerPeer() {
+  static int cached = []() {
+    const char* v = std::getenv("NCCL_GIN_FANOUT");
+    if (v == nullptr || *v == 0) return kDefaultFanout;
+    int n = std::atoi(v);
+    if (n <= 0) return kDefaultFanout;
+    if (n > 32) n = 32;  // sanity clamp
+    LOG(INFO) << "NCCL_GIN_FANOUT=" << n << " (per-peer parallel send sockets)";
+    return n;
+  }();
+  return cached;
+}
 
 // ---- CollComm ----
 
