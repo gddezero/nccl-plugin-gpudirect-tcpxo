@@ -112,36 +112,52 @@ int main(int argc, char** argv) {
   CHECK_NCCL(ncclCommInitRank(&comm, nranks, id, rank));
   fprintf(stderr, "[rank %d] comm init OK\n", rank);
 
-  // Tiny AllReduce on 16 floats. Rank 0 contributes 1.0 at every slot,
-  // rank 1 contributes 2.0; sum reduce -> all ranks see 3.0.
-  constexpr int kN = 16;
-  float* d = nullptr;
-  CHECK_CUDA(cudaMalloc(&d, kN * sizeof(float)));
-  float h[kN];
-  for (int i = 0; i < kN; ++i) h[i] = 1.0f * (rank + 1);
-  CHECK_CUDA(cudaMemcpy(d, h, kN * sizeof(float), cudaMemcpyHostToDevice));
+  // Use a large symmetric AllGather to push NCCL toward the GIN kernel
+  // (all_gather_gin). Each rank contributes 1 MB; total recv = nranks MB.
+  constexpr size_t kPerRank = 1 << 20;     // 1 MiB per rank
+  constexpr size_t kTotal = kPerRank;       // we reuse the same window for send+recv
+  void* sbuf = nullptr;
+  void* rbuf = nullptr;
+  CHECK_NCCL(ncclMemAlloc(&sbuf, kPerRank));
+  CHECK_NCCL(ncclMemAlloc(&rbuf, kPerRank * nranks));
+  ncclWindow_t swin = nullptr;
+  ncclWindow_t rwin = nullptr;
+  CHECK_NCCL(ncclCommWindowRegister(comm, sbuf, kPerRank, &swin, 0));
+  CHECK_NCCL(ncclCommWindowRegister(comm, rbuf, kPerRank * nranks, &rwin, 0));
+  fprintf(stderr, "[rank %d] symmetric windows OK (sbuf=%p rbuf=%p)\n",
+          rank, sbuf, rbuf);
 
-  fprintf(stderr, "[rank %d] AllReduce 16 floats\n", rank);
-  CHECK_NCCL(ncclAllReduce(d, d, kN, ncclFloat, ncclSum, comm, 0));
+  // Fill send buffer with distinctive pattern: byte = (rank+1)
+  CHECK_CUDA(cudaMemset(sbuf, rank + 1, kPerRank));
+  CHECK_CUDA(cudaMemset(rbuf, 0, kPerRank * nranks));
+
+  fprintf(stderr, "[rank %d] AllGather %zu bytes per rank\n", rank, kPerRank);
+  CHECK_NCCL(ncclAllGather(sbuf, rbuf, kPerRank, ncclInt8, comm, 0));
   CHECK_CUDA(cudaStreamSynchronize(0));
-  CHECK_CUDA(cudaMemcpy(h, d, kN * sizeof(float), cudaMemcpyDeviceToHost));
+  fprintf(stderr, "[rank %d] AllGather done, verifying\n", rank);
 
-  fprintf(stderr, "[rank %d] result h[0]=%.2f h[15]=%.2f\n", rank, h[0],
-          h[kN - 1]);
-  float expected = 0;
-  for (int r = 0; r < nranks; ++r) expected += (r + 1);
+  // Pull back a slice from each rank's region and verify content.
   bool ok = true;
-  for (int i = 0; i < kN; ++i) {
-    if (h[i] != expected) {
-      fprintf(stderr, "[rank %d] MISMATCH at %d: got %.2f want %.2f\n", rank,
-              i, h[i], expected);
-      ok = false;
-      break;
+  uint8_t sample[16];
+  for (int r = 0; r < nranks; ++r) {
+    CHECK_CUDA(cudaMemcpy(sample, (uint8_t*)rbuf + r * kPerRank, sizeof(sample),
+                          cudaMemcpyDeviceToHost));
+    uint8_t want = (uint8_t)(r + 1);
+    for (size_t i = 0; i < sizeof(sample); ++i) {
+      if (sample[i] != want) {
+        fprintf(stderr, "[rank %d] MISMATCH region %d byte %zu got %u want %u\n",
+                rank, r, i, sample[i], want);
+        ok = false;
+        break;
+      }
     }
   }
 
+  CHECK_NCCL(ncclCommWindowDeregister(comm, swin));
+  CHECK_NCCL(ncclCommWindowDeregister(comm, rwin));
   CHECK_NCCL(ncclCommDestroy(comm));
-  CHECK_CUDA(cudaFree(d));
+  CHECK_NCCL(ncclMemFree(sbuf));
+  CHECK_NCCL(ncclMemFree(rbuf));
   fprintf(stderr, "[rank %d] %s\n", rank, ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
