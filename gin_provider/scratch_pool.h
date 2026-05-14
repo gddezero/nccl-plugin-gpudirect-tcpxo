@@ -33,8 +33,12 @@
 namespace fastrak::gin {
 
 constexpr size_t kWireHeaderSize = 64;
-constexpr size_t kTxSlotsPerPeer = 32;   // outbound header slots per peer
-constexpr size_t kRxSlots = 256;         // inbound header pool slots
+// M6: bumped from 32 → 1024 because we removed the synchronous hdr Send
+// DONE wait in IputCommon — without that wait, the next Iput would wrap
+// the per-peer ring before the previous Send had drained the slot. 1024
+// slots × 64 B × 16 peers = 1 MiB scratch per CollComm, still tiny.
+constexpr size_t kTxSlotsPerPeer = 1024; // outbound header slots per peer
+constexpr size_t kRxSlots = 1024;        // inbound header pool slots
 
 struct ScratchPool {
   void*       device_ptr = nullptr;     // cudaMalloc base

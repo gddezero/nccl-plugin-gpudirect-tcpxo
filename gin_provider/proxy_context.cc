@@ -124,6 +124,37 @@ void CollComm::set_signal_buffer(GdrPinnedRegion region) {
             << signal_host_map_ << " size=" << signal_size_bytes_ << " bytes";
 }
 
+uint8_t* CollComm::signal_host_addr(uint64_t signal_handle,
+                                    uint64_t signal_off) {
+  // M6: prefer per-MemHandle GDR map when sender provided an explicit
+  // signal_handle. This is what DeepEP dispatch needs — its scratch
+  // signal area is a regular cudaMalloc'd buffer (not the FORCE_SO
+  // signalsDev), so the buffer-specific GDR pin we created in RegMrSym
+  // is the only host-writable view of it.
+  if (signal_handle != 0) {
+    MemHandle* mh = lookup_memhandle(signal_handle);
+    if (mh != nullptr && mh->bytes >= signal_off + sizeof(uint64_t)) {
+      void* hm = mh->gdr_host_map();
+      if (hm != nullptr) {
+        return static_cast<uint8_t*>(hm) + signal_off;
+      }
+      static std::atomic<int> dbg{0};
+      if (dbg.fetch_add(1) < 8) {
+        LOG(WARNING) << "signal_host_addr: mhandle 0x" << std::hex
+                     << signal_handle
+                     << " has no GDR pin (size=" << std::dec << mh->bytes
+                     << " base=" << mh->base << "); falling back";
+      }
+    }
+  }
+  // Fallback: primary per-context signal buffer (NCCL barrier path).
+  if (signal_host_map_ != nullptr &&
+      signal_off + sizeof(uint64_t) <= signal_size_bytes_) {
+    return reinterpret_cast<uint8_t*>(signal_host_map_) + signal_off;
+  }
+  return nullptr;
+}
+
 // ---- GinCtx ----
 
 GinCtx::~GinCtx() { StopProgress(); }

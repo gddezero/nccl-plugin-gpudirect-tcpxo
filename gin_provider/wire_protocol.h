@@ -68,15 +68,22 @@ struct WireHeader {
   uint16_t flags;          // bitmask of kWireFlag*
   uint32_t source_rank;
   uint32_t dest_rank;      // sanity check
-  uint64_t seq;
+  // Peer mhandle key identifying the SIGNAL buffer on the destination rank.
+  // Both ranks register the same logical buffer with identical ordinal keys
+  // (see proxy_context.cc::register_memhandle), so the sender's local key
+  // for a buffer is also the receiver's key for that buffer.
+  // 0 means "use the per-context primary signal buffer attached via
+  // FORCE_SO" (NCCL barrier path back-compat).
+  uint64_t signal_handle;
   uint64_t dst_handle;     // peer's MemHandle key for dst window
   uint64_t dst_off;
   uint64_t size;           // payload bytes after this header
   uint64_t signal_val;
-  // Byte offset within the destination rank's signalsDev buffer.
-  // Encoded by NCCL proxy shim as
+  // Byte offset within the destination rank's signal buffer (either the
+  // signal_handle one or, if signal_handle==0, the primary per-context
+  // FORCE_SO buffer). NCCL proxy shim encodes:
   //   signal_off = (signal_id + ctx_id * nSignalsPerCtx) * sizeof(uint64_t).
-  // Receiver does atomic_add at signalsDev_host_map[signal_off / 8].
+  // Receiver does atomic_add at <signal_buffer_host_map>[signal_off / 8].
   uint64_t signal_off;
 };
 static_assert(sizeof(WireHeader) == 64,

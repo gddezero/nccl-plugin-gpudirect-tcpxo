@@ -69,6 +69,15 @@ struct MemHandle {
   uint64_t dmabuf_offset = 0;
   dxs::Reg local_reg = 0;
   std::vector<dxs::Reg> peer_regs;  // size = nranks; peer_regs[r] is rank r's view
+
+  // Optional GDR pin: when this MemHandle was registered as
+  // NCCL_PTR_CUDA, the plugin tries to GDRCopy-pin the underlying GPU
+  // memory so the host proxy thread can do CPU-side atomic_add for
+  // PutSignal/Signal landing in arbitrary CUDA buffers (M6: DeepEP
+  // dispatch scratch, not just NCCL's small FORCE_SO signalsDev).
+  // shared_ptr keeps MemHandle copyable through flat_hash_map ops.
+  std::shared_ptr<GdrPinnedRegion> gdr_pin;
+  void* gdr_host_map() const { return gdr_pin ? gdr_pin->host_map() : nullptr; }
 };
 
 class CollComm {
@@ -116,6 +125,12 @@ class CollComm {
   void set_signal_buffer(GdrPinnedRegion region);
   uint64_t* signal_host_map() const { return signal_host_map_; }
   size_t signal_size_bytes() const { return signal_size_bytes_; }
+
+  // Resolve a (signal_handle, signal_off) pair to a CPU-writable byte
+  // address. Returns nullptr if no map can be found or if the offset is
+  // out of range. signal_handle == 0 falls back to the primary FORCE_SO
+  // signal buffer (for NCCL barrier path back-compat).
+  uint8_t* signal_host_addr(uint64_t signal_handle, uint64_t signal_off);
 
  private:
   int dev_ = -1;

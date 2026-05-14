@@ -137,7 +137,10 @@ void ProxyProgress::TickOutbound() {
       hdr.magic = kWireMagic;
       hdr.source_rank = static_cast<uint32_t>(cc->rank());
       hdr.dest_rank = static_cast<uint32_t>(p);
-      hdr.seq = peer_out_[p].next_seq++;
+      // M6: seq removed from WireHeader to make room for signal_handle.
+      // peer_out_[p].next_seq still bumped for local debug.
+      ++peer_out_[p].next_seq;
+      hdr.signal_handle = 0;  // PROXY mode never reaches this path; legacy.
       hdr.dst_handle = dec.dst_handle;
       hdr.dst_off = dec.dst_off;
       hdr.size = dec.size;
@@ -318,39 +321,41 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           }
         }
         if (hdr.op == kWireOpPutSignal) {
-          // GDR mapping is write-combining: use plain RMW + sfence rather
-          // than std::atomic. Single-writer per signal slot in barrier.
-          uint64_t* sigs = cc->signal_host_map();
-          if (sigs != nullptr &&
-              hdr.signal_off + sizeof(uint64_t) <= cc->signal_size_bytes()) {
-            auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(
-                reinterpret_cast<uint8_t*>(sigs) + hdr.signal_off);
+          // M6: prefer per-buffer GDR pin via signal_handle; fall back
+          // to primary FORCE_SO map. GDR mapping is write-combining,
+          // use plain RMW + sfence (single-writer per signal slot for
+          // both NCCL barrier and DeepEP dispatch signal protocols).
+          uint8_t* slot_b =
+              cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
+          if (slot_b != nullptr) {
+            auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
             uint64_t prev = *slot_u64;
             uint64_t next = prev + hdr.signal_val;
             *slot_u64 = next;
             __asm__ __volatile__("sfence" ::: "memory");
           } else {
-            LOG(ERROR) << "RunInbound: PutSignal but no signal map "
-                          "(sigs=" << sigs << " off=" << hdr.signal_off
-                       << " size=" << cc->signal_size_bytes() << ")";
+            LOG(ERROR) << "RunInbound: PutSignal no signal map "
+                          "(sig_h=0x" << std::hex << hdr.signal_handle
+                       << std::dec << " off=" << hdr.signal_off
+                       << " primary_size=" << cc->signal_size_bytes() << ")";
           }
         }
         break;
       }
       case kWireOpSignal: {
-        uint64_t* sigs = cc->signal_host_map();
-        if (sigs != nullptr &&
-            hdr.signal_off + sizeof(uint64_t) <= cc->signal_size_bytes()) {
-          auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(
-              reinterpret_cast<uint8_t*>(sigs) + hdr.signal_off);
+        uint8_t* slot_b =
+            cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
+        if (slot_b != nullptr) {
+          auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
           uint64_t prev = *slot_u64;
           uint64_t next = prev + hdr.signal_val;
           *slot_u64 = next;
           __asm__ __volatile__("sfence" ::: "memory");
         } else {
-          LOG(ERROR) << "RunInbound: Signal but no signal map (sigs="
-                     << sigs << " off=" << hdr.signal_off
-                     << " size=" << cc->signal_size_bytes() << ")";
+          LOG(ERROR) << "RunInbound: Signal no signal map (sig_h=0x"
+                     << std::hex << hdr.signal_handle << std::dec
+                     << " off=" << hdr.signal_off
+                     << " primary_size=" << cc->signal_size_bytes() << ")";
         }
         break;
       }
