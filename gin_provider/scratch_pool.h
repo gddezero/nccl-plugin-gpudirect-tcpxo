@@ -28,6 +28,7 @@
 #include "absl/status/statusor.h"
 #include "buffer_mgmt_daemon/client/buffer_mgr_client-interface.h"
 #include "dxs/client/dxs-client-types.h"
+#include "gin_provider/gdr_helper.h"
 
 namespace fastrak::gin {
 
@@ -41,6 +42,12 @@ struct ScratchPool {
   size_t      total_bytes = 0;
   dxs::Reg    reg_handle = 0;
   int         nranks = 0;
+
+  // GDR-pinned host VA over the scratch device memory. Lets us write
+  // WireHeaders directly from CPU (no cudaMemcpy round-trip that would
+  // serialize with other kernels via the default stream).
+  GdrPinnedRegion gdr_region;
+  void*       host_ptr = nullptr;       // host VA == device_ptr's GDR map
 
   // Region offsets (bytes from device_ptr).
   size_t      tx_base_off = 0;          // = 0

@@ -647,36 +647,84 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
       tls_tx_seq[rank % 64]++ & static_cast<uint32_t>(kTxSlotsPerPeer - 1);
   size_t hdr_off = sp->TxSlotOffset(static_cast<int>(rank), slot_idx);
 
-  // The NCCL proxy thread may be on a different CUDA context; ensure we use
-  // device 0 (matches scratch_pool's cudaMalloc) and clear any sticky error
-  // from a prior async kernel before issuing our own copy.
-  static thread_local bool tls_cuda_inited = false;
-  if (!tls_cuda_inited) {
-    cudaSetDevice(0);
-    cudaGetLastError();  // swallow stale error
-    tls_cuda_inited = true;
-  }
-
-  cudaError_t cerr = cudaMemcpy(
-      static_cast<uint8_t*>(sp->device_ptr) + hdr_off, &hdr, sizeof(hdr),
-      cudaMemcpyHostToDevice);
-  if (cerr != cudaSuccess) {
-    LOG(ERROR) << "IputCommon: cudaMemcpy failed: "
-               << cudaGetErrorString(cerr);
-    return ncclInternalError;
+  // Stage the WireHeader. Prefer the GDR-mapped host VA (no kernel
+  // serialization). Fall back to cudaMemcpy only when GDR pin was missing,
+  // which would just be on systems without GDRCopy installed.
+  if (sp->host_ptr != nullptr) {
+    void* dst = static_cast<uint8_t*>(sp->host_ptr) + hdr_off;
+    std::memcpy(dst, &hdr, sizeof(hdr));
+    __asm__ __volatile__("sfence" ::: "memory");
+  } else {
+    static thread_local bool tls_cuda_inited = false;
+    if (!tls_cuda_inited) {
+      cudaSetDevice(0);
+      cudaGetLastError();
+      tls_cuda_inited = true;
+    }
+    cudaError_t cerr = cudaMemcpy(
+        static_cast<uint8_t*>(sp->device_ptr) + hdr_off, &hdr, sizeof(hdr),
+        cudaMemcpyHostToDevice);
+    if (cerr != cudaSuccess) {
+      LOG(ERROR) << "IputCommon: cudaMemcpy failed: "
+                 << cudaGetErrorString(cerr);
+      return ncclInternalError;
+    }
   }
 
   auto req = std::make_unique<GinRequest>();
   req->coll = cc;
   req->scratch_slot = slot_idx;
 
+  static std::atomic<int> snd_pre{0};
+  if (snd_pre.fetch_add(1) < 4) {
+    LOG(INFO) << "IputCommon BEFORE-Send peer=" << global_rank
+              << " hdr_off=" << hdr_off
+              << " size=" << sizeof(WireHeader)
+              << " reg=" << sp->reg_handle;
+  }
   auto hdr_or = peer->send_sock->Send(hdr_off, sizeof(WireHeader),
                                       sp->reg_handle);
+  static std::atomic<int> snd_post{0};
+  if (snd_post.fetch_add(1) < 4) {
+    LOG(INFO) << "IputCommon AFTER-Send peer=" << global_rank
+              << " ok=" << hdr_or.ok()
+              << (hdr_or.ok() ? "" : (": " + std::string(hdr_or.status().message())));
+  }
   if (!hdr_or.ok()) {
     LOG(ERROR) << "IputCommon: header Send failed: " << hdr_or.status();
     return ncclInternalError;
   }
   req->hdr_op = std::move(*hdr_or);
+
+  // DEBUG: synchronously wait for hdr send to complete + log result.
+  // If this hangs, the dxs Send is not being driven; if it errors, the
+  // mesh / reg / peer is wrong.
+  {
+    auto deadline = absl::Now() + absl::Seconds(5);
+    bool done = false;
+    while (absl::Now() < deadline) {
+      auto s = req->hdr_op->Test();
+      if (s.has_value()) {
+        if (!s->ok()) {
+          LOG(ERROR) << "IputCommon: hdr Send op error: " << *s
+                     << " peer=" << global_rank << " hdr_off=" << hdr_off;
+          return ncclInternalError;
+        }
+        done = true;
+        break;
+      }
+      std::this_thread::yield();
+    }
+    static std::atomic<int> sd_dbg{0};
+    if (sd_dbg.fetch_add(1) < 4) {
+      LOG(INFO) << "IputCommon hdr Send "
+                << (done ? "DONE" : "TIMEOUT(5s)")
+                << " peer=" << global_rank
+                << " hdr_off=" << hdr_off
+                << " op=" << wire_op
+                << " sig_off=" << signal_off;
+    }
+  }
 
   if (size > 0 && wire_op != kWireOpSignal && wire_op != kWireOpFlush) {
     if (src_mh == nullptr || src_mh->local_reg == 0) {

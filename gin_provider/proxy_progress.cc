@@ -250,16 +250,25 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                  << "]: header recv wait: " << sz_or.status();
       break;
     }
-    // Read the header back from device memory into a host copy.
+    // Read the header back. Prefer GDR-mapped host VA (no cudaMemcpy
+    // serialization). The same write-combining caveats apply: we just read
+    // a 64-byte header that the NIC has already DMA'd in, so a load fence
+    // is enough.
     WireHeader hdr;
-    void* hdr_dev =
-        static_cast<uint8_t*>(scratch->device_ptr) + rx_off;
-    cudaError_t cerr =
-        cudaMemcpy(&hdr, hdr_dev, sizeof(hdr), cudaMemcpyDeviceToHost);
-    if (cerr != cudaSuccess) {
-      LOG(ERROR) << "RunInbound: cudaMemcpy(header) failed: "
-                 << cudaGetErrorString(cerr);
-      continue;
+    if (scratch->host_ptr != nullptr) {
+      __asm__ __volatile__("lfence" ::: "memory");
+      std::memcpy(&hdr, static_cast<uint8_t*>(scratch->host_ptr) + rx_off,
+                  sizeof(hdr));
+    } else {
+      void* hdr_dev =
+          static_cast<uint8_t*>(scratch->device_ptr) + rx_off;
+      cudaError_t cerr =
+          cudaMemcpy(&hdr, hdr_dev, sizeof(hdr), cudaMemcpyDeviceToHost);
+      if (cerr != cudaSuccess) {
+        LOG(ERROR) << "RunInbound: cudaMemcpy(header) failed: "
+                   << cudaGetErrorString(cerr);
+        continue;
+      }
     }
     if (hdr.magic != kWireMagic) {
       LOG(ERROR) << "RunInbound: bad magic 0x" << std::hex << hdr.magic;

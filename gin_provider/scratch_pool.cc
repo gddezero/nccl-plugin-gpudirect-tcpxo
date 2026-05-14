@@ -71,10 +71,26 @@ absl::StatusOr<std::unique_ptr<ScratchPool>> AllocateScratchPool(
   }
   p->reg_handle = *reg_or;
 
+  // Pin via GDRCopy so the proxy thread can write WireHeaders from CPU
+  // without going through cudaMemcpy (which serializes with other compute
+  // kernels via the legacy default stream and stalls when the barrier
+  // kernel is mid-flight).
+  if (GdrAvailable()) {
+    auto pin_or = GdrPinnedRegion::Create(p->device_ptr, alloc_bytes);
+    if (pin_or.ok()) {
+      p->gdr_region = std::move(*pin_or);
+      p->host_ptr = p->gdr_region.host_map();
+    } else {
+      LOG(WARNING) << "AllocateScratchPool: GDR pin failed: "
+                   << pin_or.status() << " — falling back to cudaMemcpy";
+    }
+  }
+
   LOG(INFO) << "AllocateScratchPool: " << alloc_bytes
             << " bytes, tx_per_peer=" << p->tx_per_peer_bytes
             << " rx_total=" << p->rx_total_bytes
-            << " reg=" << static_cast<unsigned long long>(p->reg_handle);
+            << " reg=" << static_cast<unsigned long long>(p->reg_handle)
+            << " host_ptr=" << p->host_ptr;
   return p;
 }
 

@@ -57,6 +57,7 @@ cc_library(
     srcs = ["scratch_pool.cc"],
     hdrs = ["scratch_pool.h"],
     deps = [
+        ":gdr_helper",
         "//buffer_mgmt_daemon/client:buffer_mgr_client-interface",
         "//dxs/client:dxs-client-types",
         "//nccl_cuda:cuda_common",
