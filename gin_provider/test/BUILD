@@ -16,6 +16,15 @@ cc_binary(
     ],
 )
 
+cc_binary(
+    name = "two_rank_loopback_test",
+    srcs = ["two_rank_loopback_test.cc"],
+    linkopts = ["-ldl"],
+    deps = [
+        "//gin_provider:nccl_gin_v13_abi",
+    ],
+)
+
 # NCCL >= 2.30.4 integration test. Built on demand via:
 #   bazel build --define=enable_nccl_init_test=1 //gin_provider/test:nccl_init_test
 # To skip when NCCL libs aren't present on the build machine, gate via tags.
