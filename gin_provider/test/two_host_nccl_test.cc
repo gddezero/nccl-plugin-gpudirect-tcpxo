@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
 
   // Use a large symmetric AllGather to push NCCL toward the GIN kernel
   // (all_gather_gin). Each rank contributes 1 MB; total recv = nranks MB.
-  constexpr size_t kPerRank = 1 << 20;     // 1 MiB per rank
+  constexpr size_t kPerRank = 64ULL << 20;  // 64 MiB per rank — push toward GIN
   constexpr size_t kTotal = kPerRank;       // we reuse the same window for send+recv
   void* sbuf = nullptr;
   void* rbuf = nullptr;
