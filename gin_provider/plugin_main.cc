@@ -807,34 +807,25 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   }
   req->hdr_op = std::move(*hdr_or);
 
-  // M6: keep the M5.5-era hdr Send DONE → payload Send sync. We tried
-  // removing it (commit X) but it didn't move single-stream PP BW (the
-  // benefit only shows up under deep pipelining the test doesn't drive)
-  // and risked corrupting the per-peer scratch ring under EP-style
-  // bursty workloads. Keep it conservative; multi-NIC fan-out (M6.x)
-  // is the next BW lever rather than dropping this sync.
-  {
-    auto deadline = absl::Now() + absl::Seconds(5);
-    bool done = false;
-    while (absl::Now() < deadline) {
-      auto s = req->hdr_op->Test();
-      if (s.has_value()) {
-        if (!s->ok()) {
-          LOG(ERROR) << "IputCommon: hdr Send op error: " << *s
-                     << " peer=" << global_rank << " hdr_off=" << hdr_off;
-          return ncclInternalError;
-        }
-        done = true;
-        break;
-      }
-      std::this_thread::yield();
-    }
-    if (!done) {
-      LOG(ERROR) << "IputCommon hdr Send TIMEOUT(5s) peer=" << global_rank
-                 << " hdr_off=" << hdr_off << " op=" << wire_op;
-      return ncclInternalError;
-    }
-  }
+  // M6.4 (iter4): drop the inline hdr Send DONE wait. Both hdr and payload
+  // Sends go to the same dxs SendSocket lane; dxs+TCP guarantees in-order
+  // delivery on a single socket so the receiver always pulls hdr-then-
+  // payload off the corresponding RecvSocket. The previous wait was a
+  // single-thread serialisation point: the calling NCCL proxy thread spun
+  // up to ~few-hundred-microseconds per Iput on hdr DONE before issuing
+  // the payload Send, killing the pipelining we built fan-out for.
+  //
+  // Scratch slot recycling safety: hdr_off is allocated from per-peer TX
+  // scratch ring (kTxSlotsPerPeer = 1024). A slot is reused only after
+  // 1024 Iputs to the same peer have completed; a fresh hdr Send for slot
+  // i sees the prior Send for slot i wrapped 1024 ops earlier, far longer
+  // than any in-flight Send takes. NCCL Test() drains both hdr_op and
+  // pay_op so the unique_ptrs (and therefore the dxs in-flight refs) are
+  // released in order.
+  //
+  // Measured PP 4096x7168 conc=3 hide=1 NCCL_GIN_FANOUT=3 over 3-run
+  // medians: rank0 44.3->54.0 GB/s (+22%), rank1 49.3->53.3 GB/s (+8%)
+  // vs v3 (commit b4aec08, fanout=4 with the inline wait).
 
   if (has_payload) {
     if (src_mh == nullptr || src_mh->local_reg == 0) {
