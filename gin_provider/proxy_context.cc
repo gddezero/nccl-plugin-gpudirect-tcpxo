@@ -19,44 +19,85 @@
 
 namespace fastrak::gin {
 
-ProxyContext::~ProxyContext() { Shutdown(); }
+// ---- CollComm ----
 
-absl::Status ProxyContext::Init(int nranks, int rank, uint32_t queue_size,
-                                int n_counters, int n_signals) {
-  rank_ = rank;
+CollComm::~CollComm() {
+  // Destructors of held unique_ptrs handle teardown (DXS sockets close in
+  // their own destructors via SendMessage(CloseDataSockMessage)).
+  peers_.clear();
+}
+
+absl::Status CollComm::Init(
+    int dev, uint8_t fastrak_idx, std::string nic_ip, int nranks, int rank,
+    dxs::DxsClientInterface* absl_nonnull dxs,
+    tcpdirect::BufferManagerClientInterface* absl_nonnull buf) {
+  dev_ = dev;
+  fastrak_idx_ = fastrak_idx;
+  nic_ip_ = std::move(nic_ip);
   nranks_ = nranks;
-  ASSIGN_OR_RETURN(gpu_ctx_, AllocateProxyGpuCtx(nranks, queue_size,
-                                                 n_counters, n_signals));
+  rank_ = rank;
+  dxs_ = dxs;
+  buf_ = buf;
   peers_.resize(nranks);
-  // Progress thread is created lazily by the plugin host once peer
-  // sockets are wired (in Connect / Accept). Init alone does not start it.
   return absl::OkStatus();
 }
 
-void ProxyContext::Shutdown() {
-  if (progress_ != nullptr) {
-    progress_.reset();
+void CollComm::set_peer(int peer_rank, PeerConn conn) {
+  peers_.at(peer_rank) = std::move(conn);
+}
+
+PeerConn* CollComm::peer(int peer_rank) {
+  if (peer_rank < 0 || static_cast<size_t>(peer_rank) >= peers_.size()) {
+    return nullptr;
   }
-  peers_.clear();
-  gpu_ctx_.reset();
+  return &peers_[peer_rank];
 }
 
-void ProxyContext::register_peer(int rank_idx, PeerConn conn) {
-  peers_.at(rank_idx) = std::move(conn);
-}
-
-uint64_t ProxyContext::register_memhandle(MemHandle h) {
+uint64_t CollComm::register_memhandle(MemHandle h) {
   absl::MutexLock l(&mh_mu_);
   uint64_t key = next_mh_key_++;
   memhandles_.emplace(key, std::move(h));
   return key;
 }
 
-MemHandle* ProxyContext::lookup_memhandle(uint64_t key) {
+MemHandle* CollComm::lookup_memhandle(uint64_t key) {
   absl::MutexLock l(&mh_mu_);
   auto it = memhandles_.find(key);
   if (it == memhandles_.end()) return nullptr;
   return &it->second;
+}
+
+void CollComm::erase_memhandle(uint64_t key) {
+  absl::MutexLock l(&mh_mu_);
+  memhandles_.erase(key);
+}
+
+// ---- GinCtx ----
+
+GinCtx::~GinCtx() { StopProgress(); }
+
+absl::Status GinCtx::Init(uint32_t queue_size, int n_counters, int n_signals) {
+  if (coll_ == nullptr) {
+    return absl::FailedPreconditionError("GinCtx::Init: coll_ is null");
+  }
+  ASSIGN_OR_RETURN(
+      gpu_ctx_, AllocateProxyGpuCtx(coll_->nranks(), queue_size, n_counters,
+                                    n_signals));
+  return absl::OkStatus();
+}
+
+void GinCtx::StartProgress() {
+  if (progress_ == nullptr) {
+    progress_ = std::make_unique<ProxyProgress>(this);
+  }
+  progress_->Start();
+}
+
+void GinCtx::StopProgress() {
+  if (progress_ != nullptr) {
+    progress_->Stop();
+    progress_.reset();
+  }
 }
 
 }  // namespace fastrak::gin

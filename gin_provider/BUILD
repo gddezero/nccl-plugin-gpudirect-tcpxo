@@ -30,10 +30,28 @@ cc_library(
 )
 
 cc_library(
-    name = "proxy_context",
-    srcs = ["proxy_context.cc"],
-    hdrs = ["proxy_context.h"],
+    name = "gfd_decoder",
+    srcs = ["gfd_decoder.cc"],
+    hdrs = ["gfd_decoder.h"],
     deps = [
+        "@nccl//:plugin_lib",
+    ],
+)
+
+# Merged: proxy_context + proxy_progress live in one library to avoid a
+# circular dep (GinCtx owns a ProxyProgress; ProxyProgress reads GinCtx state).
+cc_library(
+    name = "proxy_runtime",
+    srcs = [
+        "proxy_context.cc",
+        "proxy_progress.cc",
+    ],
+    hdrs = [
+        "proxy_context.h",
+        "proxy_progress.h",
+    ],
+    deps = [
+        ":gfd_decoder",
         ":gpu_ctx_alloc",
         "//buffer_mgmt_daemon/client:buffer_mgr_client",
         "//buffer_mgmt_daemon/client:buffer_mgr_client-interface",
@@ -54,31 +72,6 @@ cc_library(
 )
 
 cc_library(
-    name = "gfd_decoder",
-    srcs = ["gfd_decoder.cc"],
-    hdrs = ["gfd_decoder.h"],
-    deps = [
-        "@nccl//:plugin_lib",
-    ],
-)
-
-cc_library(
-    name = "proxy_progress",
-    srcs = ["proxy_progress.cc"],
-    hdrs = ["proxy_progress.h"],
-    deps = [
-        ":gfd_decoder",
-        ":gpu_ctx_alloc",
-        ":proxy_context",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-        "@nccl//:plugin_lib",
-    ],
-)
-
-cc_library(
     name = "nccl_gin_v13_abi",
     hdrs = ["nccl_gin_v13_abi.h"],
     deps = ["@nccl//:plugin_lib"],
@@ -87,13 +80,17 @@ cc_library(
 cc_library(
     name = "gin_plugin",
     srcs = ["plugin_main.cc"],
-    hdrs = ["plugin_main.h"],
+    hdrs = ["plugin_main.h", "listen_handle.h"],
     linkopts = ["-Wl,--export-dynamic-symbol=ncclGinPlugin_v13"],
     deps = [
         ":gfd_decoder",
         ":gpu_ctx_alloc",
         ":nccl_gin_v13_abi",
-        # proxy_context / proxy_progress added once webrtc/sctp builds.
+        ":proxy_runtime",
+        "//tcpdirect_plugin/fastrak_offload:fastrak_common",
+        "//tcpdirect_plugin/fastrak_offload:init",
+        "//tcpdirect_plugin/fastrak_offload:nccl_params",
+        "//tcpdirect_plugin/fastrak_offload:nic_client_router",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

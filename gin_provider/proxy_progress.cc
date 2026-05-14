@@ -19,7 +19,7 @@
 
 namespace fastrak::gin {
 
-ProxyProgress::ProxyProgress(ProxyContext* ctx) : ctx_(ctx) {
+ProxyProgress::ProxyProgress(GinCtx* ctx) : ctx_(ctx) {
   if (ctx_ != nullptr && ctx_->gpu_ctx() != nullptr) {
     local_ci_.assign(ctx_->gpu_ctx()->nranks, 0);
   }
@@ -41,8 +41,8 @@ void ProxyProgress::Stop() {
 void ProxyProgress::Run() {
   while (!stop_.load(std::memory_order_acquire)) {
     Tick();
-    // TODO(perf): replace with a monotonic spin-wait that backs off only
-    // after consecutive empty ticks.
+    // TODO(perf): replace with adaptive backoff (yield only after consecutive
+    // empty ticks; busy-wait while there is work).
     std::this_thread::sleep_for(std::chrono::microseconds(1));
   }
 }
@@ -52,8 +52,10 @@ void ProxyProgress::Tick() {
   if (gpu == nullptr) return;
 
   for (int p = 0; p < gpu->nranks; ++p) {
-    auto* pi_atomic = reinterpret_cast<std::atomic<uint32_t>*>(&gpu->host_pis[p]);
-    auto* ci_atomic = reinterpret_cast<std::atomic<uint32_t>*>(&gpu->host_cis[p]);
+    auto* pi_atomic =
+        reinterpret_cast<std::atomic<uint32_t>*>(&gpu->host_pis[p]);
+    auto* ci_atomic =
+        reinterpret_cast<std::atomic<uint32_t>*>(&gpu->host_cis[p]);
     uint32_t pi = pi_atomic->load(std::memory_order_acquire);
 
     while (local_ci_[p] != pi) {
@@ -62,11 +64,9 @@ void ProxyProgress::Tick() {
       if (!GfdReady(*gfd)) break;
 
       DecodedGfd dec = DecodeGfd(*gfd);
-
-      // TODO: dispatch dec.op to dxs::Send / dxs::RecvLinearized / signal
-      // wait for completion (or queue async and complete later)
-      // For now this is a no-op that just acks the GFD so we can validate
-      // the decoder + ring loop.
+      // TODO(M3): translate `dec` to dxs::Send / dxs::RecvLinearized via
+      //           ctx_->coll()->peer(p)->send_sock and wait for completion.
+      //           For now this is a no-op so the loop progresses for tests.
       (void)dec;
 
       ConsumeGfd(gfd);
