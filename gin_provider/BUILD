@@ -87,6 +87,7 @@ cc_library(
         ":gpu_ctx_alloc",
         ":nccl_gin_v13_abi",
         ":proxy_runtime",
+        "//nccl_cuda:cuda_common",
         "//tcpdirect_plugin/fastrak_offload:fastrak_common",
         "//tcpdirect_plugin/fastrak_offload:init",
         "//tcpdirect_plugin/fastrak_offload:nccl_params",

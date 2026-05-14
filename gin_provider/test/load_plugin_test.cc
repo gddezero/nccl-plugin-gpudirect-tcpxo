@@ -95,6 +95,35 @@ int main(int argc, char** argv) {
             props.ptrSupport, props.netDeviceType, props.railId, props.planeId);
   }
 
+  // Try plugin->listen on the first device to validate the dxs->Listen path.
+  if (ndev > 0 && p->listen != NULL) {
+    fprintf(stderr, "==> plugin->listen(dev=0)\n");
+    char handle[128] = {0};
+    void* listenComm = NULL;
+    r = p->listen(ctx, 0, handle, &listenComm);
+    fprintf(stderr, "    listen returned %d listenComm=%p\n", (int)r,
+            listenComm);
+    if (r == ncclSuccess && listenComm != NULL) {
+      // Inspect the wire ListenHandle.
+      uint32_t magic;
+      memcpy(&magic, handle, 4);
+      uint16_t version;
+      memcpy(&version, handle + 4, 2);
+      uint16_t af;
+      memcpy(&af, handle + 6, 2);
+      uint16_t port;
+      memcpy(&port, handle + 24, 2);
+      fprintf(stderr,
+              "    handle: magic=0x%x version=%u addr_family=%u port=%u\n",
+              magic, version, af, port);
+      if (p->closeListen) {
+        fprintf(stderr, "==> plugin->closeListen\n");
+        r = p->closeListen(listenComm);
+        fprintf(stderr, "    closeListen returned %d\n", (int)r);
+      }
+    }
+  }
+
   bool err = false;
   if (p->queryLastError) {
     p->queryLastError(ctx, &err);
