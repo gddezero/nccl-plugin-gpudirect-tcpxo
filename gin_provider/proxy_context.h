@@ -35,6 +35,7 @@
 #include "dxs/client/dxs-client-interface.h"
 #include "dxs/client/dxs-client-types.h"
 #include "gin_provider/gpu_ctx_alloc.h"
+#include "gin_provider/scratch_pool.h"
 
 namespace fastrak::gin {
 
@@ -82,6 +83,17 @@ class CollComm {
   // Set per-peer connection (called after dxs::Connect / Accept handshake).
   void set_peer(int peer_rank, PeerConn conn);
 
+  // Inbound socket pool. Receivers don't pre-match by source rank — they pull
+  // a WireHeader off any of these and demux on header.source_rank.
+  void push_inbound_recv_sock(std::unique_ptr<dxs::RecvSocketInterface> r) {
+    inbound_recv_socks_.push_back(std::move(r));
+  }
+  size_t num_inbound() const { return inbound_recv_socks_.size(); }
+  dxs::RecvSocketInterface* inbound(size_t i) {
+    return i < inbound_recv_socks_.size() ? inbound_recv_socks_[i].get()
+                                          : nullptr;
+  }
+
   PeerConn* peer(int peer_rank);
   size_t num_peers() const { return peers_.size(); }
   int rank() const { return rank_; }
@@ -106,6 +118,7 @@ class CollComm {
   tcpdirect::BufferManagerClientInterface* buf_ = nullptr;
 
   std::vector<PeerConn> peers_;
+  std::vector<std::unique_ptr<dxs::RecvSocketInterface>> inbound_recv_socks_;
 
   absl::Mutex mh_mu_;
   absl::flat_hash_map<uint64_t, MemHandle> memhandles_ ABSL_GUARDED_BY(mh_mu_);
@@ -124,6 +137,7 @@ class GinCtx {
   ProxyGpuCtxOwned* gpu_ctx() { return gpu_ctx_.get(); }
   CollComm* coll() { return coll_; }
   ProxyProgress* progress() { return progress_.get(); }
+  ScratchPool* scratch() { return scratch_.get(); }
 
   void StartProgress();
   void StopProgress();
@@ -132,6 +146,7 @@ class GinCtx {
   CollComm* coll_ = nullptr;          // not owned
   std::unique_ptr<ProxyGpuCtxOwned> gpu_ctx_;
   std::unique_ptr<ProxyProgress> progress_;
+  std::unique_ptr<ScratchPool> scratch_;
 };
 
 }  // namespace fastrak::gin

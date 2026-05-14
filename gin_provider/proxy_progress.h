@@ -5,32 +5,35 @@
  * license that can be found in the LICENSE.md file or at
  * https://developers.google.com/open-source/licenses/bsd
  *
- * Host progress thread that drains the GFD ring per peer.
+ * The host-side progress engine for the FasTrak GIN PROXY plugin.
  *
- * For each peer p we keep a local consumer cursor `local_ci_[p]`. Each tick:
- *   pi = atomic_load(host_pis[p])
- *   while local_ci_[p] != pi:
- *     gfd = host_queues[p * queueSize + (local_ci_[p] & (queueSize-1))]
- *     if !GfdReady(gfd) break
- *     dec = DecodeGfd(gfd)
- *     dispatch(dec):
- *       Put         -> dxs::Send(peer p, src_off, src_handle->reg, size)
- *       PutInline   -> stash inline value into a per-peer scratch reg, Send
- *       Get         -> queue a request to the peer's host proxy (out of scope M3)
- *       Signal      -> remote atomic add via a special control message
- *       Flush       -> wait for inflight ops then post a marker
- *     wait for ack (or queue async completion)
- *     ConsumeGfd(&gfd)
- *     atomic_store(host_cis[p], local_ci_[p] + 1)  // unblocks GPU device
+ * Two kinds of work happen here:
  *
- * For now this thread round-robins over peers. We can later spawn one thread
- * per NIC if a single peer's traffic dominates.
+ *   - Outbound: a single thread polls every peer's slice of the GFD ring,
+ *     decodes each consumable GFD into a WireHeader, copies the header into
+ *     the per-peer scratch ring, dxs::Sends the header, optionally dxs::Sends
+ *     the payload, waits for both Sends to ack, then advances the GPU-visible
+ *     consumer cursor (cis[peer]).
+ *
+ *   - Inbound: one thread per accepted RecvSocket. Each pre-posts a 64-byte
+ *     RecvLinearized into its slice of the rx scratch ring, parses the
+ *     resulting WireHeader, then either:
+ *       * Put / PutSignal: pre-posts a payload RecvLinearized into the
+ *         destination MemHandle's reg at dst_off, optionally bumps a signal.
+ *       * Signal:           bumps signals[signal_id] += signal_val.
+ *       * Get:              issues a GetReply send back to the peer.
+ *       * Flush:            no-op marker (used as a barrier).
+ *
+ * Performance posture: this is the simplest correct implementation —
+ * per-op synchronous send/recv and one thread per recv socket. M6 will
+ * pipeline and consolidate threads.
  */
 
 #ifndef GIN_PROVIDER_PROXY_PROGRESS_H_
 #define GIN_PROVIDER_PROXY_PROGRESS_H_
 
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -46,17 +49,27 @@ class ProxyProgress {
   void Start();
   void Stop();
 
-  // Single tick of the polling loop. Exposed so plugin->ginProgress can
-  // invoke it directly when NCCL chooses cooperative progress.
-  void Tick();
+  // One step of the outbound loop. Exposed so plugin->ginProgress can drive
+  // it cooperatively when NCCL prefers that over a dedicated thread.
+  void TickOutbound();
 
  private:
-  void Run();
+  void RunOutbound();
+  void RunInbound(size_t inbound_idx);
 
-  GinCtx* ctx_;
-  std::vector<uint32_t> local_ci_;
+  GinCtx* ctx_ = nullptr;
+
+  // Per-peer outbound state.
+  struct PeerOut {
+    uint32_t local_ci = 0;          // last consumed GFD index for this peer
+    uint64_t next_seq = 0;
+    uint32_t tx_slot = 0;           // next ring slot to use (mod kTxSlotsPerPeer)
+  };
+  std::vector<PeerOut> peer_out_;
+
   std::atomic<bool> stop_{false};
-  std::thread thread_;
+  std::thread outbound_thread_;
+  std::vector<std::thread> inbound_threads_;
 };
 
 }  // namespace fastrak::gin

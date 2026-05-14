@@ -30,6 +30,27 @@ cc_library(
 )
 
 cc_library(
+    name = "wire_protocol",
+    hdrs = ["wire_protocol.h"],
+)
+
+cc_library(
+    name = "scratch_pool",
+    srcs = ["scratch_pool.cc"],
+    hdrs = ["scratch_pool.h"],
+    deps = [
+        "//buffer_mgmt_daemon/client:buffer_mgr_client-interface",
+        "//dxs/client:dxs-client-types",
+        "//nccl_cuda:cuda_common",
+        "//nccl_cuda:cuda_defs",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "gfd_decoder",
     srcs = ["gfd_decoder.cc"],
     hdrs = ["gfd_decoder.h"],
@@ -53,6 +74,8 @@ cc_library(
     deps = [
         ":gfd_decoder",
         ":gpu_ctx_alloc",
+        ":scratch_pool",
+        ":wire_protocol",
         "//buffer_mgmt_daemon/client:buffer_mgr_client",
         "//buffer_mgmt_daemon/client:buffer_mgr_client-interface",
         "//dxs/client:dxs-client",

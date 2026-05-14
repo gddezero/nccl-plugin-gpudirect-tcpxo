@@ -83,6 +83,8 @@ absl::Status GinCtx::Init(uint32_t queue_size, int n_counters, int n_signals) {
   ASSIGN_OR_RETURN(
       gpu_ctx_, AllocateProxyGpuCtx(coll_->nranks(), queue_size, n_counters,
                                     n_signals));
+  ASSIGN_OR_RETURN(scratch_,
+                   AllocateScratchPool(coll_->nranks(), coll_->buffer_mgr()));
   return absl::OkStatus();
 }
 

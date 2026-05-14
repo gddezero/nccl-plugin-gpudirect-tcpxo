@@ -243,7 +243,10 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
     return StatusToNccl(s);
   }
 
-  // Outbound: connect to every peer rank's published listen handle.
+  // Issue all outbound connects up front. Each peer is doing the same
+  // concurrently, so if we waited for one connect to be ready before
+  // issuing the next, we would risk deadlock during the (n*(n-1)) handshake.
+  std::vector<std::unique_ptr<dxs::SendSocketInterface>> pending(nranks);
   for (int r = 0; r < nranks; ++r) {
     if (r == rank) continue;
     if (handles[r] == nullptr) {
@@ -257,7 +260,6 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
           h.version);
       return ncclInvalidArgument;
     }
-
     char addr_str[INET6_ADDRSTRLEN] = {0};
     if (h.addr_family == AF_INET) {
       inet_ntop(AF_INET, h.addr, addr_str, sizeof(addr_str));
@@ -267,27 +269,77 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
       LOG(ERROR) << "GIN Connect: handles[" << r << "] bad addr_family";
       return ncclInvalidArgument;
     }
-
     auto sock_or = dxs->Connect(addr_str, h.port);
-    if (!sock_or.ok()) return StatusToNccl(sock_or.status());
-    auto send_sock = std::move(*sock_or);
-    if (auto s = WaitSocketReady(*send_sock, "GIN Connect outbound"); !s.ok()) {
-      return StatusToNccl(s);
+    if (!sock_or.ok()) {
+      LOG(ERROR) << "GIN Connect: dxs->Connect to rank " << r << " failed: "
+                 << sock_or.status();
+      return StatusToNccl(sock_or.status());
     }
-
-    PeerConn pc;
-    pc.send_sock = std::move(send_sock);
-    cc->set_peer(r, std::move(pc));
+    pending[r] = std::move(*sock_or);
   }
 
-  // TODO(M3): inbound side. Run (nranks - 1) Accept() calls on lc->listen_sock
-  //           and match each incoming RecvSocket to its source rank via a
-  //           hello message. For PROXY-mode bring-up the device-side put goes
-  //           outbound only, so receive matching can land in M3.
+  // Interleaved progress loop: poll each pending outbound for ready, and
+  // poll listen->Accept(), until all outbound + (nranks-1) inbound are done.
+  size_t accepted = 0;
+  auto deadline = absl::Now() + absl::Seconds(120);
+  while (true) {
+    // Drain pending outbound.
+    for (int r = 0; r < nranks; ++r) {
+      if (pending[r] == nullptr) continue;
+      auto status = pending[r]->SocketReady();
+      if (!status.has_value()) continue;     // still pending
+      if (!status->ok()) {
+        LOG(ERROR) << "GIN Connect outbound to rank " << r
+                   << " failed: " << *status;
+        return StatusToNccl(*status);
+      }
+      PeerConn pc;
+      pc.send_sock = std::move(pending[r]);
+      cc->set_peer(r, std::move(pc));
+      pending[r] = nullptr;
+    }
+
+    // Drain inbound accepts.
+    if (accepted < static_cast<size_t>(nranks - 1)) {
+      auto sock_or = lc->listen_sock->Accept();
+      if (!sock_or.ok()) {
+        LOG(ERROR) << "GIN Connect: listen->Accept failed: " << sock_or.status();
+        return StatusToNccl(sock_or.status());
+      }
+      if (*sock_or != nullptr) {
+        auto sock = std::move(*sock_or);
+        if (auto s = WaitSocketReady(*sock, "GIN Connect inbound"); !s.ok()) {
+          LOG(ERROR) << "GIN inbound recv socket not ready: " << s;
+          return StatusToNccl(s);
+        }
+        cc->push_inbound_recv_sock(std::move(sock));
+        accepted++;
+      }
+    }
+
+    bool all_outbound_done = true;
+    for (int r = 0; r < nranks; ++r) {
+      if (pending[r] != nullptr) {
+        all_outbound_done = false;
+        break;
+      }
+    }
+    if (all_outbound_done &&
+        accepted >= static_cast<size_t>(nranks - 1)) {
+      break;
+    }
+    if (absl::Now() > deadline) {
+      LOG(ERROR) << "GIN Connect: handshake timed out, accepted=" << accepted
+                 << " of " << (nranks - 1);
+      return ncclSystemError;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
 
   LOG(INFO) << absl::StrFormat(
-      "GIN Connect: dev=%d rank=%d/%d outbound mesh established (%d send sockets)",
-      lc->dev, rank, nranks, nranks - 1);
+      "GIN Connect: dev=%d rank=%d/%d mesh established "
+      "(out=%d, in=%zu)",
+      lc->dev, rank, nranks, nranks - 1, accepted);
 
   *collComm = cc.release();
   return ncclSuccess;
@@ -455,7 +507,7 @@ ncclResult_t Test(void*, void*, int*) { return ncclInternalError; /* M3 */ }
 ncclResult_t GinProgress(void* ginCtx) {
   if (ginCtx != nullptr) {
     auto* ctx = static_cast<GinCtx*>(ginCtx);
-    if (ctx->progress() != nullptr) ctx->progress()->Tick();
+    if (ctx->progress() != nullptr) ctx->progress()->TickOutbound();
   }
   return ncclSuccess;
 }
