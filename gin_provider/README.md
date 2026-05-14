@@ -19,7 +19,7 @@ without the upstream DOCA-GPUNetIO + Mellanox CX-7 dependency chain.
 | Signal / Counter forwarding | ✅ atomic_add into `ProxyGpuCtx.signals[]` |
 | Get path | 🚧 stub (M3.1) |
 | Iput / IputSignal / Iget / Iflush / Test (host-side fallback) | 🚧 stubs (PROXY hot path is GPU-side GFD) |
-| End-to-end NCCL 2.30.4 integration | 🚧 NCCL build in progress |
+| End-to-end NCCL 2.30.4 integration | ✅ verified — see "Verified NCCL integration" below |
 | DeepEP V2 dispatch / combine | 🚧 needs M5 (NCCL 2.30 binary + 2-host orchestration) |
 
 ## Layout
@@ -90,6 +90,29 @@ uint32 signal_id        uint32 counter_id
 
 `op` is one of `Put / PutSignal / Signal / Get / GetReply / Flush`. Receiver
 demuxes on `source_rank`; no per-socket source matching needed.
+
+## Verified NCCL integration
+
+`gin_provider/test/nccl_init_test` linked against the locally-built
+`libnccl.so.2.30.4` reports the following success path:
+
+```
+NCCL INFO NCCL_GIN_PLUGIN set by environment to /tmp/libnccl-gin.so
+NCCL INFO NET/Plugin: Loaded gin plugin fastrak-gin-proxy (v13)
+NCCL INFO Successfully loaded external gin plugin /tmp/libnccl-gin.so
+NCCL INFO FasTrak GIN provider (PROXY mode) init: commId=..., ndev=8
+NCCL INFO Assigned GIN plugin fastrak-gin-proxy to comm
+NCCL INFO NET/fastrak-gin-proxy : GPU Direct RDMA Enabled for HCA 0..7
+NCCL INFO ncclTopoPopulateNics : Filled eth1..eth8 ... net=0/1 gin=1 keep=1
+NCCL INFO globalGinSupport 2  (== NCCL_GIN_TYPE_PROXY)
+NCCL INFO ncclCommInitRank ... Init COMPLETE
+NCCL INFO Unloading plugin /tmp/libnccl-gin.so
+==> done
+```
+
+This proves: ABI v13 compatible, NCCL discovers our 8 NICs, recognises
+GIN_PROXY mode, populates topology with `gin=1`, init / destroy lifecycle
+clean. The actual data path is exercised once nranks ≥ 2 across two hosts.
 
 ## Known limitations
 
