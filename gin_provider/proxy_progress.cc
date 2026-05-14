@@ -142,8 +142,11 @@ void ProxyProgress::TickOutbound() {
       hdr.dst_off = dec.dst_off;
       hdr.size = dec.size;
       hdr.signal_val = dec.signal_val;
-      hdr.signal_id = dec.signal_id;
-      hdr.counter_id = dec.counter_id;
+      // TickOutbound consumes our own GpuCtx queue, which NCCL PROXY mode
+      // never writes to (the shim allocates its own queues and calls
+      // IputCommon directly). signal_off stays 0 here — this code is
+      // kept only as a fallback for non-shim test paths.
+      hdr.signal_off = 0;
       const uint16_t op_mask = dec.op;
       constexpr uint16_t kOpVASignal = 1u << 5;
       constexpr uint16_t kOpGet = 1u << 6;
@@ -262,16 +265,28 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
       LOG(ERROR) << "RunInbound: bad magic 0x" << std::hex << hdr.magic;
       continue;
     }
+    static std::atomic<int> rx_dbg{0};
+    if (rx_dbg.fetch_add(1) < 8) {
+      LOG(INFO) << "RunInbound DBG #" << rx_dbg.load()
+                << " op=" << hdr.op << " src=" << hdr.source_rank
+                << " dst=" << hdr.dest_rank << " size=" << hdr.size
+                << " sig_off=" << hdr.signal_off
+                << " sig_val=" << hdr.signal_val;
+    }
 
     switch (hdr.op) {
       case kWireOpPut:
       case kWireOpPutSignal: {
-        MemHandle* dst = cc->lookup_memhandle(hdr.dst_handle);
-        if (dst == nullptr || dst->local_reg == 0) {
-          LOG(ERROR) << "RunInbound: bad dst_handle " << hdr.dst_handle;
-          break;
-        }
+        // Validate dst only if there's a payload to land. SignalInc/VA
+        // signal paths arrive with dst_handle=0 and size=0 — validation
+        // would (incorrectly) reject them and skip the signal write below.
         if (hdr.size > 0) {
+          MemHandle* dst = cc->lookup_memhandle(hdr.dst_handle);
+          if (dst == nullptr || dst->local_reg == 0) {
+            LOG(ERROR) << "RunInbound: bad dst_handle " << hdr.dst_handle
+                       << " for size=" << hdr.size << " op=" << hdr.op;
+            break;
+          }
           auto p_or = recv_sock->RecvLinearized(hdr.dst_off, hdr.size,
                                                 dst->local_reg);
           if (!p_or.ok()) {
@@ -286,24 +301,40 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             break;
           }
         }
-        if (hdr.op == kWireOpPutSignal && hdr.signal_id != 0) {
-          // signals[] is host-pinned + GPU-mapped (DEVICEMAP); host writes are
-          // visible to GPU through PCIe coherence.
-          if (static_cast<int>(hdr.signal_id) <
-              static_cast<int>(gpu->n_signals)) {
-            auto* sig = reinterpret_cast<std::atomic<uint64_t>*>(
-                &gpu->host_signals[hdr.signal_id]);
-            sig->fetch_add(hdr.signal_val, std::memory_order_release);
+        if (hdr.op == kWireOpPutSignal) {
+          // GDR mapping is write-combining: use plain RMW + sfence rather
+          // than std::atomic. Single-writer per signal slot in barrier.
+          uint64_t* sigs = cc->signal_host_map();
+          if (sigs != nullptr &&
+              hdr.signal_off + sizeof(uint64_t) <= cc->signal_size_bytes()) {
+            auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(
+                reinterpret_cast<uint8_t*>(sigs) + hdr.signal_off);
+            uint64_t prev = *slot_u64;
+            uint64_t next = prev + hdr.signal_val;
+            *slot_u64 = next;
+            __asm__ __volatile__("sfence" ::: "memory");
+          } else {
+            LOG(ERROR) << "RunInbound: PutSignal but no signal map "
+                          "(sigs=" << sigs << " off=" << hdr.signal_off
+                       << " size=" << cc->signal_size_bytes() << ")";
           }
         }
         break;
       }
       case kWireOpSignal: {
-        if (static_cast<int>(hdr.signal_id) <
-            static_cast<int>(gpu->n_signals)) {
-          auto* sig = reinterpret_cast<std::atomic<uint64_t>*>(
-              &gpu->host_signals[hdr.signal_id]);
-          sig->fetch_add(hdr.signal_val, std::memory_order_release);
+        uint64_t* sigs = cc->signal_host_map();
+        if (sigs != nullptr &&
+            hdr.signal_off + sizeof(uint64_t) <= cc->signal_size_bytes()) {
+          auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(
+              reinterpret_cast<uint8_t*>(sigs) + hdr.signal_off);
+          uint64_t prev = *slot_u64;
+          uint64_t next = prev + hdr.signal_val;
+          *slot_u64 = next;
+          __asm__ __volatile__("sfence" ::: "memory");
+        } else {
+          LOG(ERROR) << "RunInbound: Signal but no signal map (sigs="
+                     << sigs << " off=" << hdr.signal_off
+                     << " size=" << cc->signal_size_bytes() << ")";
         }
         break;
       }

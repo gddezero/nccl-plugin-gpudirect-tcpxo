@@ -72,6 +72,14 @@ void CollComm::erase_memhandle(uint64_t key) {
   memhandles_.erase(key);
 }
 
+void CollComm::set_signal_buffer(GdrPinnedRegion region) {
+  signal_region_ = std::move(region);
+  signal_host_map_ = static_cast<uint64_t*>(signal_region_.host_map());
+  signal_size_bytes_ = signal_region_.size();
+  LOG(INFO) << "CollComm: signal buffer attached via GDR, host_map="
+            << signal_host_map_ << " size=" << signal_size_bytes_ << " bytes";
+}
+
 // ---- GinCtx ----
 
 GinCtx::~GinCtx() { StopProgress(); }

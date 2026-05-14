@@ -34,6 +34,24 @@ cc_library(
     hdrs = ["wire_protocol.h"],
 )
 
+# GDRCopy dlopen wrapper. Used to obtain a host-side mapping of NCCL's
+# signalsDev (cuMemAlloc'd GPU memory) so the host proxy thread can do
+# atomic_add directly. Falls back gracefully if libgdrapi.so is missing.
+cc_library(
+    name = "gdr_helper",
+    srcs = ["gdr_helper.cc"],
+    hdrs = ["gdr_helper.h"],
+    linkopts = ["-ldl"],
+    deps = [
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
 cc_library(
     name = "scratch_pool",
     srcs = ["scratch_pool.cc"],
@@ -72,6 +90,7 @@ cc_library(
         "proxy_progress.h",
     ],
     deps = [
+        ":gdr_helper",
         ":gfd_decoder",
         ":gpu_ctx_alloc",
         ":scratch_pool",
@@ -106,6 +125,7 @@ cc_library(
     hdrs = ["plugin_main.h", "listen_handle.h"],
     linkopts = ["-Wl,--export-dynamic-symbol=ncclGinPlugin_v13"],
     deps = [
+        ":gdr_helper",
         ":gfd_decoder",
         ":gpu_ctx_alloc",
         ":nccl_gin_v13_abi",

@@ -34,6 +34,7 @@
 #include "buffer_mgmt_daemon/client/buffer_mgr_client-interface.h"
 #include "dxs/client/dxs-client-interface.h"
 #include "dxs/client/dxs-client-types.h"
+#include "gin_provider/gdr_helper.h"
 #include "gin_provider/gpu_ctx_alloc.h"
 #include "gin_provider/scratch_pool.h"
 
@@ -108,6 +109,14 @@ class CollComm {
   MemHandle* lookup_memhandle(uint64_t key);
   void erase_memhandle(uint64_t key);
 
+  // GDRCopy-mapped signal buffer (NCCL proxy shim's per-context signalsDev).
+  // Lifetime: pinned on the FORCE_SO+CUDA RegMrSym call right after our
+  // CreateContext, released on the matching DeregMrSym (or CollComm dtor).
+  // Read by ProxyProgress inbound thread to do host-side atomic_add.
+  void set_signal_buffer(GdrPinnedRegion region);
+  uint64_t* signal_host_map() const { return signal_host_map_; }
+  size_t signal_size_bytes() const { return signal_size_bytes_; }
+
  private:
   int dev_ = -1;
   uint8_t fastrak_idx_ = 0;
@@ -123,6 +132,14 @@ class CollComm {
   absl::Mutex mh_mu_;
   absl::flat_hash_map<uint64_t, MemHandle> memhandles_ ABSL_GUARDED_BY(mh_mu_);
   uint64_t next_mh_key_ ABSL_GUARDED_BY(mh_mu_) = 1;
+
+  // GDR-pinned signal buffer for the most recent GinCtx attached to this
+  // CollComm. Access is read-mostly after attach; ProxyProgress inbound
+  // reads signal_host_map_ (raw pointer) for hot-path atomic_add. The
+  // GdrPinnedRegion holds the pin/map ownership.
+  GdrPinnedRegion signal_region_;
+  uint64_t* signal_host_map_ = nullptr;
+  size_t signal_size_bytes_ = 0;
 };
 
 // Per createContext() instance: owns the GPU-visible proxy context and the

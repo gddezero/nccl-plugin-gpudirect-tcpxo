@@ -32,6 +32,7 @@
 #include "dxs/client/dxs-client-interface.h"
 #include "dxs/client/dxs-client-types.h"
 #include "dxs/client/oss/status_macros.h"
+#include "gin_provider/gdr_helper.h"
 #include "gin_provider/gpu_ctx_alloc.h"
 #include "gin_provider/listen_handle.h"
 #include "gin_provider/proxy_context.h"
@@ -398,7 +399,7 @@ ncclResult_t CreateContext(void* collComm, ncclGinConfig_v13_t* config,
 }
 
 ncclResult_t RegMrSym(void* collComm, void* data, size_t size, int type,
-                      uint64_t /*mrFlags*/, void** mhandle, void** ginHandle) {
+                      uint64_t mrFlags, void** mhandle, void** ginHandle) {
   if (collComm == nullptr || mhandle == nullptr) return ncclInvalidArgument;
   auto* cc = static_cast<CollComm*>(collComm);
 
@@ -434,11 +435,32 @@ ncclResult_t RegMrSym(void* collComm, void* data, size_t size, int type,
     // {rank, reg, base, size} tuple and let NCCL exchange it OOB.
     *ginHandle = reinterpret_cast<void*>(key);
   }
+
+  // The NCCL proxy shim (gin_host_proxy.cc) calls regMrSym with
+  // NCCL_PTR_CUDA + NCCL_NET_MR_FLAG_FORCE_SO right after createContext to
+  // register its `signalsDev` cuMemAlloc'd buffer. Pin it via GDRCopy so
+  // the host proxy thread can do __atomic_fetch_add on the device memory
+  // (cuMemAlloc memory is not host-accessible by default).
+  constexpr uint64_t kForceSO = 1ull << 0;  // NCCL_NET_MR_FLAG_FORCE_SO
+  if ((type & NCCL_PTR_CUDA) && (mrFlags & kForceSO)) {
+    if (GdrAvailable()) {
+      auto pin_or = GdrPinnedRegion::Create(data, size);
+      if (pin_or.ok()) {
+        cc->set_signal_buffer(std::move(*pin_or));
+      } else {
+        LOG(WARNING) << "RegMrSym: GDR pin of FORCE_SO buffer failed: "
+                     << pin_or.status() << " — signal writes will fail";
+      }
+    } else {
+      LOG(WARNING) << "RegMrSym: FORCE_SO buffer registered but GDRCopy "
+                      "unavailable — signal writes will fail";
+    }
+  }
   return ncclSuccess;
 }
 
 ncclResult_t RegMrSymDmaBuf(void* collComm, void* data, size_t size, int type,
-                            uint64_t /*offset*/, int fd, uint64_t /*mrFlags*/,
+                            uint64_t /*offset*/, int fd, uint64_t mrFlags,
                             void** mhandle, void** ginHandle) {
   if (collComm == nullptr || mhandle == nullptr || fd < 0) {
     return ncclInvalidArgument;
@@ -458,6 +480,25 @@ ncclResult_t RegMrSymDmaBuf(void* collComm, void* data, size_t size, int type,
   uint64_t key = cc->register_memhandle(std::move(mh));
   *mhandle = reinterpret_cast<void*>(key);
   if (ginHandle != nullptr) *ginHandle = reinterpret_cast<void*>(key);
+
+  // Same FORCE_SO + CUDA pin path as RegMrSym (DMA-BUF route is what NCCL
+  // actually takes when ptrSupport advertises NCCL_PTR_DMABUF, which is
+  // our case). See ncclGinProxyRegMrSym in gin_host_proxy.cc.
+  constexpr uint64_t kForceSO = 1ull << 0;  // NCCL_NET_MR_FLAG_FORCE_SO
+  if ((type & NCCL_PTR_CUDA) && (mrFlags & kForceSO)) {
+    if (GdrAvailable()) {
+      auto pin_or = GdrPinnedRegion::Create(data, size);
+      if (pin_or.ok()) {
+        cc->set_signal_buffer(std::move(*pin_or));
+      } else {
+        LOG(WARNING) << "RegMrSymDmaBuf: GDR pin of FORCE_SO buffer failed: "
+                     << pin_or.status() << " — signal writes will fail";
+      }
+    } else {
+      LOG(WARNING) << "RegMrSymDmaBuf: FORCE_SO buffer registered but "
+                      "GDRCopy unavailable — signal writes will fail";
+    }
+  }
   return ncclSuccess;
 }
 
@@ -510,7 +551,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
                                uint64_t dstOff, void* dstMhandle,
                                uint32_t rank, void** request,
                                WireOp wire_op, uint64_t signal_off,
-                               uint32_t signal_id, uint64_t signal_val,
+                               uint64_t signal_val,
                                uint32_t signal_op_arg) {
   if (ginCtx == nullptr || request == nullptr) {
     LOG(ERROR) << "IputCommon: ginCtx or request null";
@@ -519,21 +560,62 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   auto* gctx = static_cast<GinCtx*>(ginCtx);
   auto* cc = gctx->coll();
   auto* sp = gctx->scratch();
+  static std::atomic<int> dbg_count{0};
+  if (dbg_count.fetch_add(1) < 8) {
+    LOG(INFO) << "IputCommon DBG #" << dbg_count.load()
+              << " op=" << wire_op << " rank=" << rank
+              << " size=" << size << " sig_off=" << signal_off
+              << " sig_val=" << signal_val
+              << " my_rank=" << (cc ? cc->rank() : -1);
+  }
   if (cc == nullptr || sp == nullptr) {
     LOG(ERROR) << "IputCommon: coll or scratch null";
     return ncclInternalError;
   }
 
-  // NCCL gin_host_proxy passes `rank` as the index into the peer mesh after
-  // self has been removed from the list — i.e. for my_rank=K and target
-  // logical rank L, the global rank is L if L<K else L+1.
+  // NCCL proxy shim's gin_host_proxy.cc:107 iterates `for (int targetRank=0;
+  // targetRank < ctx->nRanks; targetRank++)` — so the rank param is the
+  // FULL rank, including self. Self-signal: handle locally (atomic-add to
+  // our own signal_host_map), no socket send needed.
   int my_rank = cc->rank();
   int global_rank = static_cast<int>(rank);
-  if (global_rank >= my_rank) global_rank += 1;
+  if (global_rank == my_rank) {
+    // Self-signal short-circuit. Only Signal/PutSignal need handling here;
+    // self-Put without signal would target our own memory directly.
+    if (wire_op == kWireOpSignal || wire_op == kWireOpPutSignal) {
+      uint64_t* sigs = cc->signal_host_map();
+      if (sigs != nullptr &&
+          signal_off + sizeof(uint64_t) <= cc->signal_size_bytes()) {
+        // GDRCopy maps GPU memory as write-combining; std::atomic
+        // ops are not guaranteed coherent there. Use plain RMW with
+        // explicit sfence (single-writer guaranteed for barrier case).
+        auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(
+            reinterpret_cast<uint8_t*>(sigs) + signal_off);
+        uint64_t prev = *slot_u64;
+        uint64_t next = prev + signal_val;
+        *slot_u64 = next;
+        __asm__ __volatile__("sfence" ::: "memory");
+        static std::atomic<int> ss_dbg{0};
+        if (ss_dbg.fetch_add(1) < 4) {
+          LOG(INFO) << "self-signal: off=" << signal_off
+                    << " prev=" << prev << " new=" << next;
+        }
+      } else {
+        LOG(ERROR) << "IputCommon self-signal: no signal map (sigs="
+                   << sigs << " off=" << signal_off
+                   << " size=" << cc->signal_size_bytes() << ")";
+      }
+    }
+    // Fabricate a no-op request that reports done immediately.
+    auto req = std::make_unique<GinRequest>();
+    req->coll = cc;
+    req->scratch_slot = 0;
+    *request = req.release();
+    return ncclSuccess;
+  }
   PeerConn* peer = cc->peer(global_rank);
   if (peer == nullptr || peer->send_sock == nullptr) {
-    LOG(ERROR) << "IputCommon: bad peer logical_rank=" << rank
-               << " global_rank=" << global_rank
+    LOG(ERROR) << "IputCommon: bad peer rank=" << rank
                << " my_rank=" << my_rank
                << " num_peers=" << cc->num_peers();
     return ncclInvalidArgument;
@@ -557,8 +639,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   hdr.dst_off = dstOff;
   hdr.size = size;
   hdr.signal_val = signal_val;
-  hdr.signal_id = signal_id;
-  (void)signal_off;
+  hdr.signal_off = signal_off;
   (void)signal_op_arg;
 
   // Stage header in TX scratch for this peer.
@@ -618,7 +699,7 @@ ncclResult_t Iput(void* ginCtx, int context, uint64_t srcOff, void* srcMhandle,
                   size_t size, uint64_t dstOff, void* dstMhandle,
                   uint32_t rank, void** request) {
   return IputCommon(ginCtx, context, srcOff, srcMhandle, size, dstOff,
-                    dstMhandle, rank, request, kWireOpPut, 0, 0, 0, 0);
+                    dstMhandle, rank, request, kWireOpPut, 0, 0, 0);
 }
 
 ncclResult_t IputSignal(void* ginCtx, int context, uint64_t srcOff,
@@ -628,7 +709,7 @@ ncclResult_t IputSignal(void* ginCtx, int context, uint64_t srcOff,
                         uint32_t signalOp, void** request) {
   return IputCommon(ginCtx, context, srcOff, srcMhandle, size, dstOff,
                     dstMhandle, rank, request, kWireOpPutSignal, signalOff,
-                    /*signal_id=*/0, signalValue, signalOp);
+                    signalValue, signalOp);
 }
 
 ncclResult_t Iget(void* ginCtx, int context, uint64_t remoteOff,
@@ -637,13 +718,13 @@ ncclResult_t Iget(void* ginCtx, int context, uint64_t remoteOff,
   // Stub: emit a Get header; receiver-side Get reply not yet implemented.
   return IputCommon(ginCtx, context, /*srcOff=*/0, /*srcMhandle=*/localMhandle,
                     /*size=*/0, remoteOff, remoteMhandle, rank, request,
-                    kWireOpGet, 0, 0, 0, 0);
+                    kWireOpGet, 0, 0, 0);
 }
 
 ncclResult_t Iflush(void* ginCtx, int context, void* mhandle, uint32_t rank,
                     void** request) {
   return IputCommon(ginCtx, context, 0, mhandle, 0, 0, mhandle, rank, request,
-                    kWireOpFlush, 0, 0, 0, 0);
+                    kWireOpFlush, 0, 0, 0);
 }
 
 ncclResult_t Test(void* /*collComm*/, void* request, int* done) {

@@ -73,8 +73,11 @@ struct WireHeader {
   uint64_t dst_off;
   uint64_t size;           // payload bytes after this header
   uint64_t signal_val;
-  uint32_t signal_id;
-  uint32_t counter_id;
+  // Byte offset within the destination rank's signalsDev buffer.
+  // Encoded by NCCL proxy shim as
+  //   signal_off = (signal_id + ctx_id * nSignalsPerCtx) * sizeof(uint64_t).
+  // Receiver does atomic_add at signalsDev_host_map[signal_off / 8].
+  uint64_t signal_off;
 };
 static_assert(sizeof(WireHeader) == 64,
               "WireHeader must be exactly 64 bytes");
