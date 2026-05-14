@@ -639,9 +639,13 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   auto* gctx = static_cast<GinCtx*>(ginCtx);
   auto* cc = gctx->coll();
   auto* sp = gctx->scratch();
-  static std::atomic<int> dbg_count{0};
-  if (dbg_count.fetch_add(1) < 50) {
-    LOG(INFO) << "IputCommon DBG #" << dbg_count.load()
+  // v5 (M6.6): TLS dbg counter — replaces static std::atomic<int> dbg_count.
+  // IputCommon is the hot Iput path; called by every NCCL proxy thread per
+  // chunk. Contended atomic fetch_add added per-call cache-line bounces.
+  thread_local int dbg_count_tls = 0;
+  if (dbg_count_tls < 50) {
+    ++dbg_count_tls;
+    LOG(INFO) << "IputCommon DBG #" << dbg_count_tls
               << " op=" << wire_op << " rank=" << rank
               << " size=" << size << " sig_off=" << signal_off
               << " sig_val=" << signal_val
@@ -673,8 +677,10 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
         uint64_t next = prev + signal_val;
         *slot_u64 = next;
         __asm__ __volatile__("sfence" ::: "memory");
-        static std::atomic<int> ss_dbg{0};
-        if (ss_dbg.fetch_add(1) < 4) {
+        // v5: TLS — see dbg_count_tls.
+        thread_local int ss_dbg_tls = 0;
+        if (ss_dbg_tls < 4) {
+          ++ss_dbg_tls;
           LOG(INFO) << "self-signal: sig_h=0x" << std::hex << sig_h
                     << " off=" << std::dec << signal_off
                     << " prev=" << prev << " new=" << next;
@@ -787,16 +793,20 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   req->coll = cc;
   req->scratch_slot = slot_idx;
 
-  static std::atomic<int> snd_pre{0};
-  if (snd_pre.fetch_add(1) < 4) {
+  // v5: TLS — see dbg_count_tls.
+  thread_local int snd_pre_tls = 0;
+  if (snd_pre_tls < 4) {
+    ++snd_pre_tls;
     LOG(INFO) << "IputCommon BEFORE-Send peer=" << global_rank
               << " hdr_off=" << hdr_off
               << " size=" << sizeof(WireHeader)
               << " reg=" << sp->reg_handle;
   }
   auto hdr_or = sock->Send(hdr_off, sizeof(WireHeader), sp->reg_handle);
-  static std::atomic<int> snd_post{0};
-  if (snd_post.fetch_add(1) < 4) {
+  // v5: TLS — see dbg_count_tls.
+  thread_local int snd_post_tls = 0;
+  if (snd_post_tls < 4) {
+    ++snd_post_tls;
     LOG(INFO) << "IputCommon AFTER-Send peer=" << global_rank
               << " ok=" << hdr_or.ok()
               << (hdr_or.ok() ? "" : (": " + std::string(hdr_or.status().message())));

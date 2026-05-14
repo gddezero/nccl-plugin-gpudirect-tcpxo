@@ -292,9 +292,15 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
       LOG(ERROR) << "RunInbound: bad magic 0x" << std::hex << hdr.magic;
       continue;
     }
-    static std::atomic<int> rx_dbg{0};
-    if (rx_dbg.fetch_add(1) < 50) {
-      LOG(INFO) << "RunInbound DBG #" << rx_dbg.load()
+    // v5 (M6.6): TLS dbg counter (was static std::atomic<int> rx_dbg).
+    // The atomic fetch_add cost a cross-thread cache-line bounce on every
+    // inbound header even after the first 50 firings, contended across
+    // num_inbound() threads. TLS counters are zero-contention; each thread
+    // independently logs its first 50 hdrs.
+    thread_local int rx_dbg_tls = 0;
+    if (rx_dbg_tls < 50) {
+      ++rx_dbg_tls;
+      LOG(INFO) << "RunInbound DBG #" << rx_dbg_tls
                 << " op=" << hdr.op << " src=" << hdr.source_rank
                 << " dst=" << hdr.dest_rank << " size=" << hdr.size
                 << " sig_off=" << hdr.signal_off
@@ -327,8 +333,10 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             LOG(ERROR) << "RunInbound: payload recv wait: " << p_sz.status();
             break;
           }
-          static std::atomic<int> pl_dbg{0};
-          if (pl_dbg.fetch_add(1) < 16) {
+          // v5 (M6.6): TLS dbg counter — see rx_dbg_tls comment.
+          thread_local int pl_dbg_tls = 0;
+          if (pl_dbg_tls < 16) {
+            ++pl_dbg_tls;
             LOG(INFO) << "RunInbound payload OK off=" << hdr.dst_off
                       << " size=" << hdr.size << " got=" << *p_sz
                       << " dst_handle=0x" << std::hex << hdr.dst_handle
