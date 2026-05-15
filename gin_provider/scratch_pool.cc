@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -24,9 +25,18 @@
 namespace fastrak::gin {
 
 absl::StatusOr<std::unique_ptr<ScratchPool>> AllocateScratchPool(
-    int nranks, tcpdirect::BufferManagerClientInterface* buf) {
-  if (nranks <= 0 || buf == nullptr) {
+    int nranks,
+    const std::array<tcpdirect::BufferManagerClientInterface*, kMaxNics>&
+        bufmgrs,
+    int primary_nic_idx) {
+  if (nranks <= 0) {
     return absl::InvalidArgumentError("AllocateScratchPool: bad args");
+  }
+  if (primary_nic_idx < 0 || primary_nic_idx >= kMaxNics ||
+      bufmgrs[primary_nic_idx] == nullptr) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("AllocateScratchPool: bad primary_nic_idx=",
+                     primary_nic_idx));
   }
   auto p = std::make_unique<ScratchPool>();
   p->nranks = nranks;
@@ -63,13 +73,28 @@ absl::StatusOr<std::unique_ptr<ScratchPool>> AllocateScratchPool(
   }
   p->dmabuf_fd = *fd_or;
 
-  auto reg_or = buf->RegBuf(p->dmabuf_fd, alloc_bytes);
-  if (!reg_or.ok()) {
-    close(p->dmabuf_fd);
-    cudaFree(p->device_ptr);
-    return reg_or.status();
+  // v9: register the SAME dma-buf with EVERY NIC's BufferManagerClient so
+  // sender lanes spread across NICs each have a valid reg.
+  int n_regged = 0;
+  for (int i = 0; i < kMaxNics; ++i) {
+    if (bufmgrs[i] == nullptr) continue;
+    auto reg_or = bufmgrs[i]->RegBuf(p->dmabuf_fd, alloc_bytes);
+    if (!reg_or.ok()) {
+      // Roll back any earlier successful regs and fail.
+      for (int j = 0; j < i; ++j) {
+        if (bufmgrs[j] != nullptr && p->per_nic_reg_handles[j] != 0) {
+          (void)bufmgrs[j]->DeregBuf(p->per_nic_reg_handles[j]);
+          p->per_nic_reg_handles[j] = 0;
+        }
+      }
+      close(p->dmabuf_fd);
+      cudaFree(p->device_ptr);
+      return reg_or.status();
+    }
+    p->per_nic_reg_handles[i] = *reg_or;
+    ++n_regged;
   }
-  p->reg_handle = *reg_or;
+  p->reg_handle = p->per_nic_reg_handles[primary_nic_idx];
 
   // Pin via GDRCopy so the proxy thread can write WireHeaders from CPU
   // without going through cudaMemcpy (which serializes with other compute
@@ -89,17 +114,24 @@ absl::StatusOr<std::unique_ptr<ScratchPool>> AllocateScratchPool(
   LOG(INFO) << "AllocateScratchPool: " << alloc_bytes
             << " bytes, tx_per_peer=" << p->tx_per_peer_bytes
             << " rx_total=" << p->rx_total_bytes
-            << " reg=" << static_cast<unsigned long long>(p->reg_handle)
+            << " n_regged=" << n_regged
+            << " primary_reg=" << static_cast<unsigned long long>(p->reg_handle)
             << " host_ptr=" << p->host_ptr;
   return p;
 }
 
 void FreeScratchPool(ScratchPool* p,
-                     tcpdirect::BufferManagerClientInterface* buf) {
+                     const std::array<tcpdirect::BufferManagerClientInterface*,
+                                      kMaxNics>& bufmgrs) {
   if (p == nullptr) return;
-  if (p->reg_handle != 0 && buf != nullptr) {
-    auto s = buf->DeregBuf(p->reg_handle);
-    if (!s.ok()) LOG(ERROR) << "FreeScratchPool DeregBuf: " << s;
+  for (int i = 0; i < kMaxNics; ++i) {
+    if (p->per_nic_reg_handles[i] != 0 && bufmgrs[i] != nullptr) {
+      auto s = bufmgrs[i]->DeregBuf(p->per_nic_reg_handles[i]);
+      if (!s.ok()) {
+        LOG(ERROR) << "FreeScratchPool DeregBuf nic=" << i << ": " << s;
+      }
+      p->per_nic_reg_handles[i] = 0;
+    }
   }
   if (p->dmabuf_fd >= 0) close(p->dmabuf_fd);
   if (p->device_ptr != nullptr) cudaFree(p->device_ptr);

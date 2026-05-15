@@ -22,9 +22,11 @@
 #ifndef GIN_PROVIDER_PROXY_CONTEXT_H_
 #define GIN_PROVIDER_PROXY_CONTEXT_H_
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
@@ -52,13 +54,22 @@ inline void SetGinError(const char* /*where*/ = nullptr) {
   g_has_error.store(true, std::memory_order_release);
 }
 
-// One per `plugin->listen(dev, ...)` call.
+// v9: one ListenComm now owns up to kMaxNics ListenSockets — one per
+// fastrak NIC — so peers can fan out across N receiver NICs. The primary
+// (NCCL-driven) NIC is the dev NCCL called Listen(dev=...) on; others are
+// added best-effort and entries with a null socket stay null. Indexing is
+// by fastrak NIC index (NOT a dense [0..N) range).
 struct ListenComm {
   int dev = -1;
-  uint8_t fastrak_idx = 0;
-  std::string nic_ip;
-  std::unique_ptr<dxs::ListenSocketInterface> listen_sock;
-  uint64_t nonce = 0;       // randomized for the wire ListenHandle
+  uint8_t primary_fastrak_idx = 0;  // NCCL's chosen dev's fastrak idx
+  std::string primary_nic_ip;
+  // listen_socks[i] is the ListenSocket bound to fastrak NIC i (or null if
+  // we couldn't / chose not to open one on that NIC).
+  std::array<std::unique_ptr<dxs::ListenSocketInterface>, kMaxNics>
+      listen_socks;
+  std::array<uint16_t, kMaxNics> listen_ports = {};   // port for slot i
+  std::array<std::string, kMaxNics> nic_ips = {};     // IP for slot i
+  uint64_t nonce = 0;
   uint64_t listen_token = 0;
 };
 
@@ -74,15 +85,22 @@ struct ListenComm {
 // count is N*(nranks-1).
 struct PeerConn {
   std::vector<std::unique_ptr<dxs::SendSocketInterface>> send_socks;
+  // v9: parallel to send_socks. local_nic_idx_for_lane[lane] is the local
+  // fastrak NIC index that the lane's send socket was opened from. The
+  // sender uses this to look up MemHandle::per_nic_regs / ScratchPool::
+  // per_nic_reg_handles for that lane.
+  std::vector<int> local_nic_idx_for_lane;
   std::atomic<uint64_t> tx_seq{0};  // round-robin lane selector
   PeerConn() = default;
   PeerConn(const PeerConn&) = delete;
   PeerConn& operator=(const PeerConn&) = delete;
   PeerConn(PeerConn&& o) noexcept
       : send_socks(std::move(o.send_socks)),
+        local_nic_idx_for_lane(std::move(o.local_nic_idx_for_lane)),
         tx_seq(o.tx_seq.load(std::memory_order_relaxed)) {}
   PeerConn& operator=(PeerConn&& o) noexcept {
     send_socks = std::move(o.send_socks);
+    local_nic_idx_for_lane = std::move(o.local_nic_idx_for_lane);
     tx_seq.store(o.tx_seq.load(std::memory_order_relaxed),
                  std::memory_order_relaxed);
     return *this;
@@ -98,16 +116,32 @@ struct PeerConn {
 constexpr int kDefaultFanout = 1;
 int FanoutPerPeer();
 
+// v9: multi-NIC fan-out is OFF by default. When ON, Listen opens kMaxNics
+// ListenSockets and Connect spreads lanes across local NICs; each MemHandle
+// is registered with every NIC's BufferManagerClient. Empirically the
+// multi-NIC path on a3-mega regresses test_pp 4096x7168 conc=3 fanout=3 vs
+// single-NIC v7 (~42 GB/s vs ~55 GB/s) because of extra inbound thread
+// contention and per-NIC reg duplication; keep it as opt-in until the
+// receiver-side cost is amortized. Set NCCL_GIN_MULTI_NIC=1 to enable.
+bool MultiNicEnabled();
+
 // Memory registration: holds the local DXS Reg plus the array of peer Regs
 // gathered out-of-band by NCCL after RegMrSym (peer regs are stored in the
 // `ginHandle` that NCCL distributes to peers; we look them up by mhandle).
+//
+// v9: per_nic_regs[i] is the local DXS Reg this buffer received from NIC i's
+// BufferManagerClient (or 0 if not registered there). Sender lane targeting
+// local NIC i uses per_nic_regs[i]; receiver inbound on NIC j uses
+// per_nic_regs[j]. local_reg is kept as an alias of per_nic_regs
+// [primary_nic] for legacy callers and logs.
 struct MemHandle {
   void*    base = nullptr;
   size_t   bytes = 0;
   int      ptr_type = 0;     // NCCL_PTR_HOST / CUDA / DMABUF
   int      dmabuf_fd = -1;
   uint64_t dmabuf_offset = 0;
-  dxs::Reg local_reg = 0;
+  std::array<dxs::Reg, kMaxNics> per_nic_regs = {};
+  dxs::Reg local_reg = 0;    // alias of per_nic_regs[primary_nic]
   std::vector<dxs::Reg> peer_regs;  // size = nranks; peer_regs[r] is rank r's view
 
   // Optional GDR pin: when this MemHandle was registered as
@@ -125,24 +159,58 @@ class CollComm {
   CollComm() = default;
   ~CollComm();
 
-  absl::Status Init(int dev, uint8_t fastrak_idx, std::string nic_ip,
-                    int nranks, int rank,
-                    dxs::DxsClientInterface* absl_nonnull dxs,
-                    tcpdirect::BufferManagerClientInterface* absl_nonnull buf);
+  // v9: per_nic_dxs[i] / per_nic_bufmgr[i] are non-null for every NIC the
+  // CollComm will send through; index i is the NIC's fastrak index. The
+  // primary (listen) NIC's slot must also be populated. nic_ips_by_idx[i]
+  // is the local IP for NIC i (used only for log lines).
+  absl::Status Init(
+      int dev, uint8_t fastrak_idx, std::string nic_ip, int nranks, int rank,
+      dxs::DxsClientInterface* absl_nonnull dxs,
+      tcpdirect::BufferManagerClientInterface* absl_nonnull buf,
+      const std::array<dxs::DxsClientInterface*, kMaxNics>& per_nic_dxs,
+      const std::array<tcpdirect::BufferManagerClientInterface*, kMaxNics>&
+          per_nic_bufmgr,
+      const std::array<std::string, kMaxNics>& nic_ips_by_idx);
 
   // Set per-peer connection (called after dxs::Connect / Accept handshake).
   void set_peer(int peer_rank, PeerConn conn);
 
   // Inbound socket pool. Receivers don't pre-match by source rank — they pull
   // a WireHeader off any of these and demux on header.source_rank.
-  void push_inbound_recv_sock(std::unique_ptr<dxs::RecvSocketInterface> r) {
+  // v9: each pushed recv_sock is tagged with the local NIC index it was
+  // accepted on, so the inbound thread knows which per_nic_reg to use.
+  void push_inbound_recv_sock(std::unique_ptr<dxs::RecvSocketInterface> r,
+                              int nic_idx) {
     inbound_recv_socks_.push_back(std::move(r));
+    inbound_nic_idx_.push_back(nic_idx);
   }
   size_t num_inbound() const { return inbound_recv_socks_.size(); }
   dxs::RecvSocketInterface* inbound(size_t i) {
     return i < inbound_recv_socks_.size() ? inbound_recv_socks_[i].get()
                                           : nullptr;
   }
+  int inbound_nic_idx(size_t i) const {
+    return i < inbound_nic_idx_.size() ? inbound_nic_idx_[i] : 0;
+  }
+
+  // v9: per-NIC accessors. Returns nullptr if NIC i is not provisioned for
+  // this CollComm.
+  dxs::DxsClientInterface* per_nic_dxs(int i) const {
+    return (i >= 0 && i < kMaxNics) ? per_nic_dxs_[i] : nullptr;
+  }
+  tcpdirect::BufferManagerClientInterface* per_nic_bufmgr(int i) const {
+    return (i >= 0 && i < kMaxNics) ? per_nic_bufmgr_[i] : nullptr;
+  }
+  const std::array<tcpdirect::BufferManagerClientInterface*, kMaxNics>&
+  per_nic_bufmgr_array() const {
+    return per_nic_bufmgr_;
+  }
+  const std::string& nic_ip_by_idx(int i) const {
+    static const std::string empty;
+    return (i >= 0 && i < kMaxNics) ? nic_ips_by_idx_[i] : empty;
+  }
+  // Number of NICs actually provisioned (non-null dxs entries).
+  int n_provisioned_nics() const { return n_provisioned_nics_; }
 
   PeerConn* peer(int peer_rank);
   size_t num_peers() const { return peers_.size(); }
@@ -198,6 +266,15 @@ class CollComm {
 
   std::vector<PeerConn> peers_;
   std::vector<std::unique_ptr<dxs::RecvSocketInterface>> inbound_recv_socks_;
+  std::vector<int> inbound_nic_idx_;  // parallel to inbound_recv_socks_
+
+  // v9: per-NIC handles. Slot i is non-null iff NIC index i is provisioned
+  // for this CollComm. The primary (listen) NIC has its slot populated too.
+  std::array<dxs::DxsClientInterface*, kMaxNics> per_nic_dxs_ = {};
+  std::array<tcpdirect::BufferManagerClientInterface*, kMaxNics>
+      per_nic_bufmgr_ = {};
+  std::array<std::string, kMaxNics> nic_ips_by_idx_;
+  int n_provisioned_nics_ = 0;
 
   absl::Mutex mh_mu_;
   absl::flat_hash_map<uint64_t, MemHandle> memhandles_ ABSL_GUARDED_BY(mh_mu_);

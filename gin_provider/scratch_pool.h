@@ -21,9 +21,11 @@
 #ifndef GIN_PROVIDER_SCRATCH_POOL_H_
 #define GIN_PROVIDER_SCRATCH_POOL_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "absl/status/statusor.h"
 #include "buffer_mgmt_daemon/client/buffer_mgr_client-interface.h"
@@ -31,6 +33,12 @@
 #include "gin_provider/gdr_helper.h"
 
 namespace fastrak::gin {
+
+// v9: per-NIC reg fan-out. a3-mega has 8 fastrak NICs; we cap at this many.
+// Each MemHandle / ScratchPool registers its dma-buf with up to kMaxNics
+// per-NIC BufferManagerClients so sender lanes targeting NIC i can use
+// per_nic_reg_handles[i] with an i-bound dxs::SendSocket.
+constexpr int kMaxNics = 8;
 
 constexpr size_t kWireHeaderSize = 64;
 // M6: bumped from 32 → 1024 because we removed the synchronous hdr Send
@@ -44,7 +52,15 @@ struct ScratchPool {
   void*       device_ptr = nullptr;     // cudaMalloc base
   int         dmabuf_fd = -1;
   size_t      total_bytes = 0;
-  dxs::Reg    reg_handle = 0;
+  // v9: per-NIC reg handle. per_nic_reg_handles[i] != 0 iff this scratch pool
+  // is registered with NIC i's BufferManagerClient. Sender lane with
+  // local NIC i uses per_nic_reg_handles[i]; receiver inbound thread on
+  // accepted-from-NIC j uses per_nic_reg_handles[j]. reg_handle is kept as
+  // an alias for per_nic_reg_handles[0] for legacy paths (TickOutbound,
+  // logs) — those run on the listen NIC which is dev 0 in single-comm
+  // tests; if you hit a non-zero NIC there, inspect per_nic_reg_handles.
+  std::array<dxs::Reg, kMaxNics> per_nic_reg_handles = {};
+  dxs::Reg    reg_handle = 0;  // alias of per_nic_reg_handles[primary_nic]
   int         nranks = 0;
 
   // GDR-pinned host VA over the scratch device memory. Lets us write
@@ -69,14 +85,20 @@ struct ScratchPool {
   }
 };
 
-// Allocate + register the scratch pool. `buf` is the per-NIC buffer manager
-// already obtained from NicClientRouter. Caller owns the returned ScratchPool
-// and must call FreeScratchPool on teardown.
+// Allocate + register the scratch pool. `bufmgrs` provides the per-NIC
+// BufferManagerClients in slot i for NIC index i; nullptr entries are
+// skipped (and per_nic_reg_handles[i] left 0). `primary_nic_idx` is the
+// listen NIC; `reg_handle` is set as an alias to per_nic_reg_handles
+// [primary_nic_idx] for legacy paths.
 absl::StatusOr<std::unique_ptr<ScratchPool>> AllocateScratchPool(
-    int nranks, tcpdirect::BufferManagerClientInterface* buf);
+    int nranks,
+    const std::array<tcpdirect::BufferManagerClientInterface*, kMaxNics>&
+        bufmgrs,
+    int primary_nic_idx);
 
 void FreeScratchPool(ScratchPool* p,
-                     tcpdirect::BufferManagerClientInterface* buf);
+                     const std::array<tcpdirect::BufferManagerClientInterface*,
+                                      kMaxNics>& bufmgrs);
 
 }  // namespace fastrak::gin
 

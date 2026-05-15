@@ -250,6 +250,13 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
   if (cc == nullptr || gpu == nullptr || scratch == nullptr) return;
   auto* recv_sock = cc->inbound(inbound_idx);
   if (recv_sock == nullptr) return;
+  // v9: this inbound thread's recv socket was accepted on a specific local
+  // NIC; use that NIC's reg handle for both the header recv and the
+  // payload recv (the dst MemHandle's per_nic_regs[nic_idx] must have
+  // been populated by RegMrSym for the corresponding bufmgr).
+  const int inbound_nic = cc->inbound_nic_idx(inbound_idx);
+  dxs::Reg hdr_recv_reg = scratch->per_nic_reg_handles[inbound_nic];
+  if (hdr_recv_reg == 0) hdr_recv_reg = scratch->reg_handle;
 
   // M6.2: each inbound thread owns a disjoint stride of the rx slot
   // ring so concurrent threads never DMA into the same 64B header slot.
@@ -270,7 +277,7 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
     rx_local = (rx_local + 1) % slice;
 
     auto recv_or = recv_sock->RecvLinearized(rx_off, sizeof(WireHeader),
-                                             scratch->reg_handle);
+                                             hdr_recv_reg);
     if (!recv_or.ok()) {
       LOG(ERROR) << "RunInbound[" << inbound_idx
                  << "]: RecvLinearized(header) failed: " << recv_or.status();
@@ -348,14 +355,19 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           // is now an error visible via QueryLastError instead of a
           // silent dropped op.
           MemHandle* dst = cc->lookup_memhandle(hdr.dst_handle);
-          if (dst == nullptr || dst->local_reg == 0) {
+          // v9: per-NIC reg lookup. dst->per_nic_regs[inbound_nic] must be
+          // non-zero (RegMrSym populates every provisioned NIC).
+          dxs::Reg dst_reg_for_nic =
+              (dst != nullptr) ? dst->per_nic_regs[inbound_nic] : 0;
+          if (dst == nullptr || dst_reg_for_nic == 0) {
             LOG(ERROR) << "RunInbound: bad dst_handle " << hdr.dst_handle
-                       << " for size=" << hdr.size << " op=" << hdr.op;
+                       << " for size=" << hdr.size << " op=" << hdr.op
+                       << " nic=" << inbound_nic;
             SetGinError("RunInbound:bad-dst-handle");
             break;
           }
           auto p_or = recv_sock->RecvLinearized(hdr.dst_off, hdr.size,
-                                                dst->local_reg);
+                                                dst_reg_for_nic);
           if (!p_or.ok()) {
             LOG(ERROR) << "RunInbound: payload RecvLinearized failed: "
                        << p_or.status();

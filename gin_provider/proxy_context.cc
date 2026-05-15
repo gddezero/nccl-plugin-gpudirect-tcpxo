@@ -28,6 +28,21 @@ namespace fastrak::gin {
 // circular includes. Read by QueryLastError; cleared on Init().
 std::atomic<bool> g_has_error{false};
 
+// v9: multi-NIC opt-in. See header comment.
+bool MultiNicEnabled() {
+  static bool cached = []() {
+    const char* v = std::getenv("NCCL_GIN_MULTI_NIC");
+    if (v == nullptr || *v == 0) return false;
+    bool on = (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' ||
+               v[0] == 't' || v[0] == 'T');
+    LOG(INFO) << "NCCL_GIN_MULTI_NIC=" << v << " -> "
+              << (on ? "ENABLED (multi-NIC fan-out)"
+                     : "disabled (single-NIC behaviour)");
+    return on;
+  }();
+  return cached;
+}
+
 // M6.2: env-overridable per-peer fan-out. Cached so we only parse once.
 int FanoutPerPeer() {
   static int cached = []() {
@@ -76,7 +91,11 @@ void CollComm::unregister_ctx(GinCtx* ctx) {
 absl::Status CollComm::Init(
     int dev, uint8_t fastrak_idx, std::string nic_ip, int nranks, int rank,
     dxs::DxsClientInterface* absl_nonnull dxs,
-    tcpdirect::BufferManagerClientInterface* absl_nonnull buf) {
+    tcpdirect::BufferManagerClientInterface* absl_nonnull buf,
+    const std::array<dxs::DxsClientInterface*, kMaxNics>& per_nic_dxs,
+    const std::array<tcpdirect::BufferManagerClientInterface*, kMaxNics>&
+        per_nic_bufmgr,
+    const std::array<std::string, kMaxNics>& nic_ips_by_idx) {
   dev_ = dev;
   fastrak_idx_ = fastrak_idx;
   nic_ip_ = std::move(nic_ip);
@@ -84,7 +103,19 @@ absl::Status CollComm::Init(
   rank_ = rank;
   dxs_ = dxs;
   buf_ = buf;
+  per_nic_dxs_ = per_nic_dxs;
+  per_nic_bufmgr_ = per_nic_bufmgr;
+  nic_ips_by_idx_ = nic_ips_by_idx;
+  n_provisioned_nics_ = 0;
+  for (int i = 0; i < kMaxNics; ++i) {
+    if (per_nic_dxs_[i] != nullptr && per_nic_bufmgr_[i] != nullptr) {
+      ++n_provisioned_nics_;
+    }
+  }
   peers_.resize(nranks);
+  LOG(INFO) << "CollComm::Init dev=" << dev << " fastrak_idx=" << (int)fastrak_idx
+            << " nic_ip=" << nic_ip_ << " rank=" << rank << "/" << nranks
+            << " n_provisioned_nics=" << n_provisioned_nics_;
   return absl::OkStatus();
 }
 
@@ -216,8 +247,12 @@ absl::Status GinCtx::Init(uint32_t queue_size, int n_counters, int n_signals) {
   ASSIGN_OR_RETURN(
       gpu_ctx_, AllocateProxyGpuCtx(coll_->nranks(), queue_size, n_counters,
                                     n_signals));
-  ASSIGN_OR_RETURN(scratch_,
-                   AllocateScratchPool(coll_->nranks(), coll_->buffer_mgr()));
+  // v9: scratch pool registers on every provisioned NIC so sender lanes
+  // spread across NICs each have a valid header reg.
+  ASSIGN_OR_RETURN(
+      scratch_,
+      AllocateScratchPool(coll_->nranks(), coll_->per_nic_bufmgr_array(),
+                          static_cast<int>(coll_->fastrak_idx())));
   // v6 (S7 attempted, REVERTED): coll_->register_ctx(this) removed —
   // see CollComm::~CollComm comment for why the synchronous-join fix
   // had to be backed out. The function is kept declared for the future

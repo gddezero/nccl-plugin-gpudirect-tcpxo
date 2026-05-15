@@ -37,20 +37,33 @@
 namespace fastrak::gin {
 
 constexpr uint32_t kListenHandleMagic = 0x4647494eu;  // 'F','G','I','N'
-constexpr uint16_t kListenHandleVersion = 1;
+// v9: bumped from 1 → 2 to encode N NIC endpoints per ListenComm so peers can
+// fan out across multiple receiver NICs. v1 layout is no longer wire-
+// compatible; both peers must run the same plugin build.
+constexpr uint16_t kListenHandleVersion = 2;
 constexpr size_t kListenHandleSize = 128;  // == NCCL_GIN_HANDLE_MAXSIZE
+
+constexpr int kListenHandleMaxNics = 8;
+
+// One NIC endpoint inside a ListenHandle. IPv4 only — every fastrak NIC on
+// a3-mega has an IPv4 address; if IPv6 is ever needed bump version again.
+struct ListenHandleNic {
+  uint8_t  addr[4];   // packed IPv4
+  uint16_t port;      // dxs listen port for this NIC
+  uint8_t  fastrak_idx;
+  uint8_t  pad;
+};
+static_assert(sizeof(ListenHandleNic) == 8, "ListenHandleNic must be 8 bytes");
 
 struct ListenHandle {
   uint32_t magic;
   uint16_t version;
-  uint16_t addr_family;
-  uint8_t  addr[16];
-  uint16_t port;
-  uint8_t  fastrak_idx;
-  uint8_t  pad0;
+  uint8_t  n_nics;
+  uint8_t  primary_nic_idx;  // index INTO `nics`, not fastrak_idx
   uint64_t nonce;
   uint64_t listen_token;
-  uint8_t  reserved[80];
+  ListenHandleNic nics[kListenHandleMaxNics];   // 8 * 8 = 64 bytes
+  uint8_t  reserved[40];
 };
 static_assert(sizeof(ListenHandle) == kListenHandleSize,
               "ListenHandle must be exactly NCCL_GIN_HANDLE_MAXSIZE bytes");
