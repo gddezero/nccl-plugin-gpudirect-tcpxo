@@ -108,11 +108,18 @@ struct PeerConn {
 };
 
 // Default fan-out per peer; can be overridden via NCCL_GIN_FANOUT env var.
-// Default 1 (= v2 behaviour, no fan-out) because each extra socket spawns a
-// dedicated inbound polling thread that adds CPU contention; small-tensor PP
-// is latency-bound and regresses sharply when CPU is divided. Bandwidth
-// workloads (>= 8 MB single payload) recover their cost — opt in via
-// NCCL_GIN_FANOUT=4 on those.
+// v10 investigation (2026-05-15): tried raising default 1 -> 3 to capture
+// the +54% PP 4096x7168 conc=3 hide=1 bandwidth gain (~35 -> ~54 GB/s on
+// 3 default-config runs; FANOUT=1/2/3 explicit runs reproduced v9
+// numbers). REVERTED because num_stress_iterations=100 reproducibly
+// corrupts data at fanout>1: v10 fanout=3 mismatch at seed=6, fanout=2 at
+// seed=8, and v9 fanout=3 at seed=14 (CUDA launch failure / torch.equal
+// mismatch). Single-iter stress and short PP profiling never expose this.
+// Until the multi-socket fan-out send path is fixed (suspect: per-socket
+// tx_seq / inbound reassembly race surfaces only after ~6+ stress
+// generations of repeated context teardown/setup), fanout>1 stays opt-in
+// for short-lived benchmark runs. Small-tensor / latency-bound paths
+// were not the limiting factor on the default change.
 constexpr int kDefaultFanout = 1;
 int FanoutPerPeer();
 
