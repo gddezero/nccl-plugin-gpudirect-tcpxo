@@ -243,6 +243,17 @@ void ProxyProgress::TickOutbound() {
   }
 }
 
+namespace {
+// v16: sharded mutex pool to avoid global serialization in cudaMemcpy
+// signal RMW fallback. Hash (signal_handle ^ signal_off) into 64 shards
+// so inbound threads with disjoint signal slots run concurrently.
+constexpr size_t kV16SignalShards = 64;
+absl::Mutex& V16SignalShard(uint64_t signal_handle, uint64_t signal_off) {
+  static absl::Mutex shards[kV16SignalShards];
+  return shards[(signal_handle ^ signal_off) & (kV16SignalShards - 1)];
+}
+}  // namespace
+
 void ProxyProgress::RunInbound(size_t inbound_idx) {
   auto* cc = ctx_ ? ctx_->coll() : nullptr;
   auto* gpu = ctx_ ? ctx_->gpu_ctx() : nullptr;
@@ -477,11 +488,58 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             *slot_u64 = prev + hdr.signal_val;
             __asm__ __volatile__("sfence" ::: "memory");
           } else {
-            LOG(ERROR) << "RunInbound: PutSignal no signal map "
-                          "(sig_h=0x" << std::hex << hdr.signal_handle
-                       << std::dec << " off=" << hdr.signal_off
-                       << " primary_size=" << cc->signal_size_bytes() << ")";
-            SetGinError("RunInbound:PutSignal:no-map");
+            // v14: GDR pin missing for signal_handle (DeepEP elastic
+            // registers ~1.16 GB scratch buffers that exceed
+            // gdr_pin_buffer limit). Fall back to D2H->RMW->H2D via
+            // cudaMemcpy on the GPU device pointer.  Holds signal_mu_
+            // across the whole RMW so concurrent local PutSignal/Signal
+            // landings see consistent updates; cross-node ordering is
+            // already serialized by wire_seq + commit_seq gate above.
+            MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
+            if (sig_mh != nullptr && sig_mh->base != nullptr &&
+                hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
+              void* sig_dev = static_cast<uint8_t*>(sig_mh->base) +
+                              hdr.signal_off;
+              absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
+                                                hdr.signal_off));
+              uint64_t prev = 0;
+              cudaError_t cerr1 = cudaMemcpy(&prev, sig_dev,
+                                             sizeof(uint64_t),
+                                             cudaMemcpyDeviceToHost);
+              if (cerr1 != cudaSuccess) {
+                LOG(ERROR) << "v14 PutSignal D2H cudaMemcpy: "
+                           << cudaGetErrorString(cerr1);
+                SetGinError("RunInbound:PutSignal:cudaMemcpy-D2H");
+              } else {
+                uint64_t newv = prev + hdr.signal_val;
+                cudaError_t cerr2 = cudaMemcpy(sig_dev, &newv,
+                                               sizeof(uint64_t),
+                                               cudaMemcpyHostToDevice);
+                if (cerr2 != cudaSuccess) {
+                  LOG(ERROR) << "v14 PutSignal H2D cudaMemcpy: "
+                             << cudaGetErrorString(cerr2);
+                  SetGinError("RunInbound:PutSignal:cudaMemcpy-H2D");
+                } else {
+                  static std::atomic<int> dbg_v14_ps{0};
+                  int n = dbg_v14_ps.fetch_add(1);
+                  if (n < 4) {
+                    LOG(INFO) << "v14: PutSignal cudaMemcpy fallback OK "
+                              << "sig_h=" << hdr.signal_handle
+                              << " off=" << hdr.signal_off
+                              << " val+=" << hdr.signal_val
+                              << " (count #" << n << ")";
+                  }
+                }
+              }
+            } else {
+              LOG(ERROR) << "RunInbound: PutSignal no signal map "
+                            "(sig_h=" << hdr.signal_handle
+                         << " off=" << hdr.signal_off
+                         << " mh=" << (sig_mh ? "found" : "null")
+                         << " primary_size=" << cc->signal_size_bytes()
+                         << ")";
+              SetGinError("RunInbound:PutSignal:no-map");
+            }
           }
         }
         bump_commit_seq(hdr.source_rank, hdr.wire_seq);
@@ -500,11 +558,52 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           *slot_u64 = prev + hdr.signal_val;
           __asm__ __volatile__("sfence" ::: "memory");
         } else {
-          LOG(ERROR) << "RunInbound: Signal no signal map (sig_h=0x"
-                     << std::hex << hdr.signal_handle << std::dec
-                     << " off=" << hdr.signal_off
-                     << " primary_size=" << cc->signal_size_bytes() << ")";
-          SetGinError("RunInbound:Signal:no-map");
+          // v14: GDR pin missing -> cudaMemcpy fallback (see PutSignal).
+          MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
+          if (sig_mh != nullptr && sig_mh->base != nullptr &&
+              hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
+            void* sig_dev = static_cast<uint8_t*>(sig_mh->base) +
+                            hdr.signal_off;
+            absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
+                                              hdr.signal_off));
+            uint64_t prev = 0;
+            cudaError_t cerr1 = cudaMemcpy(&prev, sig_dev,
+                                           sizeof(uint64_t),
+                                           cudaMemcpyDeviceToHost);
+            if (cerr1 != cudaSuccess) {
+              LOG(ERROR) << "v14 Signal D2H cudaMemcpy: "
+                         << cudaGetErrorString(cerr1);
+              SetGinError("RunInbound:Signal:cudaMemcpy-D2H");
+            } else {
+              uint64_t newv = prev + hdr.signal_val;
+              cudaError_t cerr2 = cudaMemcpy(sig_dev, &newv,
+                                             sizeof(uint64_t),
+                                             cudaMemcpyHostToDevice);
+              if (cerr2 != cudaSuccess) {
+                LOG(ERROR) << "v14 Signal H2D cudaMemcpy: "
+                           << cudaGetErrorString(cerr2);
+                SetGinError("RunInbound:Signal:cudaMemcpy-H2D");
+              } else {
+                static std::atomic<int> dbg_v14_sg{0};
+                int n = dbg_v14_sg.fetch_add(1);
+                if (n < 4) {
+                  LOG(INFO) << "v14: Signal cudaMemcpy fallback OK "
+                            << "sig_h=" << hdr.signal_handle
+                            << " off=" << hdr.signal_off
+                            << " val+=" << hdr.signal_val
+                            << " (count #" << n << ")";
+                }
+              }
+            }
+          } else {
+            LOG(ERROR) << "RunInbound: Signal no signal map (sig_h="
+                       << hdr.signal_handle
+                       << " off=" << hdr.signal_off
+                       << " mh=" << (sig_mh ? "found" : "null")
+                       << " primary_size=" << cc->signal_size_bytes()
+                       << ")";
+            SetGinError("RunInbound:Signal:no-map");
+          }
         }
         bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;

@@ -713,7 +713,7 @@ ncclResult_t RegMrSym(void* collComm, void* data, size_t size, int type,
   // never receive signals, so we cap at 64 MiB. If a buffer above the
   // cap actually gets a signal write, we'll log and the wire path
   // falls back to the primary FORCE_SO map (or fails noisily).
-  constexpr size_t kGdrPinSizeCap = 64ull * 1024 * 1024;
+  constexpr size_t kGdrPinSizeCap = 4ull * 1024 * 1024 * 1024;  // v17: GDR pin large bufs
   constexpr uint64_t kForceSO = 1ull << 0;  // NCCL_NET_MR_FLAG_FORCE_SO
   bool is_force_so = (mrFlags & kForceSO) != 0;
   if ((type & NCCL_PTR_CUDA) && GdrAvailable() &&
@@ -806,7 +806,7 @@ ncclResult_t RegMrSymDmaBuf(void* collComm, void* data, size_t size, int type,
   // takes when our ptrSupport advertises NCCL_PTR_DMABUF (this is our
   // primary path on a3-mega; gin_host_proxy.cc::ncclGinProxyRegMrSym
   // routes through here when fd >= 0).
-  constexpr size_t kGdrPinSizeCap = 64ull * 1024 * 1024;
+  constexpr size_t kGdrPinSizeCap = 4ull * 1024 * 1024 * 1024;  // v17: GDR pin large bufs
   constexpr uint64_t kForceSO = 1ull << 0;  // NCCL_NET_MR_FLAG_FORCE_SO
   bool is_force_so = (mrFlags & kForceSO) != 0;
   if ((type & NCCL_PTR_CUDA) && GdrAvailable() &&
