@@ -743,11 +743,18 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   // multi-thread overhead that overwhelms the wire saving when each op
   // is sub-millisecond on the wire. Threshold tunable via NCCL_GIN_FANOUT_MIN
   // (default 1 MiB; small-tensor PP at 512KB stays on lane 0).
+  // v8: lowered default 1 MiB -> 16 KiB. The receiver has FANOUT inbound
+  // threads each owning a recv socket; with the old 1 MiB threshold,
+  // sub-MiB ops + signal/PutSignal traffic all funneled into lane 0,
+  // leaving lanes 1..N-1 idle on small-msg-heavy phases (DeepEP combine).
+  // 16 KiB is below the per-token chunk size for typical PP/dispatch and
+  // safely above any single-cacheline signal: signals (size==0) still take
+  // lane 0 due to the size==0 check, so no race on the GDR signal slot.
   static const size_t kFanoutMinBytes = []() {
     const char* v = std::getenv("NCCL_GIN_FANOUT_MIN");
-    if (v == nullptr || *v == 0) return size_t{1ull << 20};  // 1 MiB
+    if (v == nullptr || *v == 0) return size_t{16ull << 10};  // 16 KiB
     long n = std::atol(v);
-    return n > 0 ? static_cast<size_t>(n) : size_t{1ull << 20};
+    return n > 0 ? static_cast<size_t>(n) : size_t{16ull << 10};
   }();
   const size_t fanout = peer->send_socks.size();
   size_t lane = 0;

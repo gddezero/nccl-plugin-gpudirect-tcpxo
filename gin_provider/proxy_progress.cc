@@ -34,16 +34,22 @@ namespace {
 
 constexpr absl::Duration kSendTimeout = absl::Seconds(60);
 
-// Spin until SendOp completes or timeout.
+// v8 (kept): deadline check throttled to every 4096 spins (absl::Now() at
+// every spin was a measurable hot-path overhead). v8b PAUSE-instead-of-
+// yield variant was reverted: inbound threads share cores with NCCL proxy
+// threads, and pure busy-spin starved the proxy thread of CPU. yield()
+// gives schedulers a chance to interleave, and the deadline-check throttle
+// alone shaves ~5-10ns per spin worth of absl::Now overhead.
 absl::Status WaitSendDone(dxs::SendOpInterface& op, absl::string_view what) {
   auto deadline = absl::Now() + kSendTimeout;
+  uint32_t spins = 0;
   while (true) {
     auto s = op.Test();
     if (s.has_value()) {
       if (!s->ok()) return *s;
       return absl::OkStatus();
     }
-    if (absl::Now() > deadline) {
+    if ((++spins & 4095) == 0 && absl::Now() > deadline) {
       return absl::DeadlineExceededError(
           absl::StrCat("WaitSendDone timeout: ", what));
     }
@@ -54,10 +60,11 @@ absl::Status WaitSendDone(dxs::SendOpInterface& op, absl::string_view what) {
 absl::StatusOr<uint64_t> WaitRecvDone(dxs::LinearizedRecvOpInterface& op,
                                       absl::string_view what) {
   auto deadline = absl::Now() + kSendTimeout;
+  uint32_t spins = 0;
   while (true) {
     auto s = op.Test();
     if (s.has_value()) return *s;
-    if (absl::Now() > deadline) {
+    if ((++spins & 4095) == 0 && absl::Now() > deadline) {
       return absl::DeadlineExceededError(
           absl::StrCat("WaitRecvDone timeout: ", what));
     }
