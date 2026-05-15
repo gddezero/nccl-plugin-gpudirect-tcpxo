@@ -1,5 +1,4 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
-load("@rules_cuda//cuda:defs.bzl", "cuda_library")
 
 # BUILD for the GCP TCPXO NCCL GIN provider plugin (PROXY mode).
 #
@@ -81,16 +80,6 @@ cc_library(
 
 # Merged: proxy_context + proxy_progress live in one library to avoid a
 # circular dep (GinCtx owns a ProxyProgress; ProxyProgress reads GinCtx state).
-cuda_library(
-    name = "signal_atomic_kernel",
-    srcs = ["signal_atomic.cu"],
-    hdrs = ["signal_atomic.h"],
-    deps = [
-        "@local_cuda//:cuda",
-        "@cuda_headers",
-    ],
-)
-
 cc_library(
     name = "proxy_runtime",
     srcs = [
@@ -104,7 +93,6 @@ cc_library(
     deps = [
         ":gdr_helper",
         ":gfd_decoder",
-        ":signal_atomic_kernel",
         ":gpu_ctx_alloc",
         ":scratch_pool",
         ":wire_protocol",
@@ -140,7 +128,6 @@ cc_library(
     deps = [
         ":gdr_helper",
         ":gfd_decoder",
-        ":signal_atomic_kernel",
         ":gpu_ctx_alloc",
         ":nccl_gin_v13_abi",
         ":proxy_runtime",

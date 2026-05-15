@@ -32,7 +32,6 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include <cuda_runtime.h>
 #include "absl/synchronization/mutex.h"
 #include "buffer_mgmt_daemon/client/buffer_mgr_client-interface.h"
 #include "dxs/client/dxs-client-interface.h"
@@ -275,11 +274,6 @@ class CollComm {
   // reduction) without needing PCIe atomics. ~30ns per call.
   absl::Mutex* signal_mu() { return &signal_mu_; }
 
-  // v20: dedicated stream for GPU atomicAdd kernel signal RMW. Lazy-init
-  // on first call under signal_mu_. Per-CollComm so launches serialize
-  // in wire_seq order; GPU atomicAdd handles cross-source atomicity.
-  cudaStream_t signal_stream();
-
   // v11: per-source-rank "next seq to commit" counter. The receiver uses
   // this to enforce cross-lane post-payload ordering when fanout > 1: an
   // inbound thread receives op with hdr.wire_seq==S, finishes the payload
@@ -344,7 +338,6 @@ class CollComm {
 
   // v7 (S3): see signal_mu() comment above.
   absl::Mutex signal_mu_;
-  cudaStream_t signal_stream_ = nullptr;  // v20
 
   // v11: per-source-rank receive-side commit-order counter. Sized to
   // nranks_ in Init. std::atomic isn't move/copy, so we hold them in a

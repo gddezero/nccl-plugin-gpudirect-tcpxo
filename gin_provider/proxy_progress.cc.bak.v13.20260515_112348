@@ -7,8 +7,6 @@
  */
 
 #include "gin_provider/proxy_progress.h"
-#include "plugin/nccl_net.h"
-#include "gin_provider/signal_atomic.h"
 
 #include <cuda_runtime.h>
 
@@ -20,8 +18,6 @@
 #include <thread>
 
 #include "absl/log/log.h"
-#include "gin_provider/gdr_helper.h"
-#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -247,96 +243,11 @@ void ProxyProgress::TickOutbound() {
   }
 }
 
-namespace {
-// v16: sharded mutex pool to avoid global serialization in cudaMemcpy
-// signal RMW fallback. Hash (signal_handle ^ signal_off) into 64 shards
-// so inbound threads with disjoint signal slots run concurrently.
-constexpr size_t kV16SignalShards = 64;
-absl::Mutex& V16SignalShard(uint64_t signal_handle, uint64_t signal_off) {
-  static absl::Mutex shards[kV16SignalShards];
-  return shards[(signal_handle ^ signal_off) & (kV16SignalShards - 1)];
-}
-
-// v18: lazy chunked GDR pin to serve PutSignal/Signal RMW for buffers
-// that exceeded the upfront GDR pin cap. Keys: (mh*, chunk_off). Pins
-// 1 MiB chunks on demand and caches forever (until plugin shutdown).
-constexpr size_t kV18ChunkBits = 20;        // 1 MiB chunks
-constexpr size_t kV18ChunkSize = 1ull << kV18ChunkBits;
-constexpr size_t kV18ChunkMask = kV18ChunkSize - 1;
-struct V18ChunkKey {
-  MemHandle* mh;
-  size_t chunk_off;
-  bool operator==(const V18ChunkKey& o) const {
-    return mh == o.mh && chunk_off == o.chunk_off;
-  }
-  template <typename H>
-  friend H AbslHashValue(H h, const V18ChunkKey& k) {
-    return H::combine(std::move(h), reinterpret_cast<uintptr_t>(k.mh),
-                      k.chunk_off);
-  }
-};
-absl::Mutex& V18ChunkMu() { static absl::Mutex mu; return mu; }
-absl::flat_hash_map<V18ChunkKey, std::shared_ptr<GdrPinnedRegion>>&
-V18ChunkMap() {
-  static auto* m = new absl::flat_hash_map<
-      V18ChunkKey, std::shared_ptr<GdrPinnedRegion>>;
-  return *m;
-}
-// Returns host VA for the (mh, off) signal slot, lazily pinning a
-// chunk if not yet cached. Returns nullptr on pin failure.
-uint8_t* V18LazyHostAddr(MemHandle* mh, size_t off) {
-  if (mh == nullptr || mh->base == nullptr) return nullptr;
-  if (!GdrAvailable()) return nullptr;
-  size_t chunk_off = off & ~kV18ChunkMask;
-  size_t chunk_size = std::min(kV18ChunkSize, mh->bytes - chunk_off);
-  std::shared_ptr<GdrPinnedRegion> chunk;
-  {
-    absl::MutexLock l(&V18ChunkMu());
-    auto key = V18ChunkKey{mh, chunk_off};
-    auto it = V18ChunkMap().find(key);
-    if (it != V18ChunkMap().end()) {
-      chunk = it->second;
-    } else {
-      void* chunk_base = static_cast<uint8_t*>(mh->base) + chunk_off;
-      auto pin_or = GdrPinnedRegion::Create(chunk_base, chunk_size);
-      if (pin_or.ok()) {
-        chunk = std::make_shared<GdrPinnedRegion>(std::move(*pin_or));
-        V18ChunkMap()[key] = chunk;
-        static std::atomic<int> dbg{0};
-        int n = dbg.fetch_add(1);
-        if (n < 8) {
-          LOG(INFO) << "v18: lazy chunk pin OK mh=" << mh
-                    << " chunk_off=" << chunk_off
-                    << " size=" << chunk_size << " (count #" << n << ")";
-        }
-      } else {
-        static std::atomic<int> dbg_f{0};
-        if (dbg_f.fetch_add(1) < 4) {
-          LOG(WARNING) << "v18: lazy chunk pin FAILED mh=" << mh
-                       << " chunk_off=" << chunk_off
-                       << " size=" << chunk_size << ": "
-                       << pin_or.status();
-        }
-        return nullptr;
-      }
-    }
-  }
-  return static_cast<uint8_t*>(chunk->host_map()) + (off - chunk_off);
-}
-}  // namespace
-
 void ProxyProgress::RunInbound(size_t inbound_idx) {
   auto* cc = ctx_ ? ctx_->coll() : nullptr;
   auto* gpu = ctx_ ? ctx_->gpu_ctx() : nullptr;
   auto* scratch = ctx_ ? ctx_->scratch() : nullptr;
   if (cc == nullptr || gpu == nullptr || scratch == nullptr) return;
-  // v13b: this thread is started by std::thread without inheriting the CUDA
-  // device context; cudaMemcpy on inline-source paths and the existing
-  // device->host header memcpy both require that current device == cc->dev().
-  if (cc->dev() >= 0) {
-    cudaSetDevice(cc->dev());
-    cudaGetLastError();
-  }
   auto* recv_sock = cc->inbound(inbound_idx);
   if (recv_sock == nullptr) return;
   // v9: this inbound thread's recv socket was accepted on a specific local
@@ -487,35 +398,6 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             SetGinError("RunInbound:bad-dst-handle");
             break;
           }
-
-          if ((hdr.flags & kWireFlagInlineSrc) && hdr.size > 0) {
-            void* dst_dev =
-                static_cast<uint8_t*>(dst->base) + hdr.dst_off;
-            cudaError_t cerr =
-                cudaMemcpy(dst_dev, hdr.inline_data, hdr.size,
-                           cudaMemcpyHostToDevice);
-            if (cerr != cudaSuccess) {
-              LOG(ERROR) << "RunInbound: inline cudaMemcpy failed: "
-                         << cudaGetErrorString(cerr) << " size=" << hdr.size
-                         << " dev=" << cc->dev();
-              SetGinError("RunInbound:inline-cudaMemcpy");
-              break;
-            }
-            wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
-            if (hdr.op == kWireOpPutSignal && hdr.signal_handle != 0) {
-              uint8_t* slot_b =
-                  cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
-              if (slot_b != nullptr) {
-                auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
-                absl::MutexLock l(cc->signal_mu());
-                *slot_u64 += hdr.signal_val;
-                // v19: clflushopt + mfence to flush WC store buffer to PCIe
-            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
-              }
-            }
-            bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-            break;
-          }
           auto p_or = recv_sock->RecvLinearized(hdr.dst_off, hdr.size,
                                                 dst_reg_for_nic);
           if (!p_or.ok()) {
@@ -558,104 +440,13 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             absl::MutexLock l(cc->signal_mu());
             uint64_t prev = *slot_u64;
             *slot_u64 = prev + hdr.signal_val;
-            // v19: clflushopt + mfence to flush WC store buffer to PCIe
-            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
+            __asm__ __volatile__("sfence" ::: "memory");
           } else {
-            // v20: GPU atomicAdd kernel — bypasses all host-side RMW
-            // emulation (GDR pin, cudaMemcpy fallback, lazy chunk pin).
-            // Hardware-atomic; no mutex; no BAR1 contention.
-            MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
-            if (sig_mh != nullptr && (sig_mh->ptr_type & NCCL_PTR_CUDA) &&
-                sig_mh->base != nullptr &&
-                hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
-              void* sig_dev =
-                  static_cast<uint8_t*>(sig_mh->base) + hdr.signal_off;
-              cudaStream_t stream = cc->signal_stream();
-              cudaError_t cerr =
-                  LaunchSignalAdd(sig_dev, hdr.signal_val, stream);
-              if (cerr == cudaSuccess) {
-                cudaStreamSynchronize(stream);
-                static std::atomic<int> dbg_v20{0};
-                int n = dbg_v20.fetch_add(1);
-                if (n < 4) {
-                  LOG(INFO) << "v20: PutSignal atomicAdd kernel OK "
-                            << "sig_h=" << hdr.signal_handle
-                            << " off=" << hdr.signal_off
-                            << " val+=" << hdr.signal_val
-                            << " (count #" << n << ")";
-                }
-                bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-                break;
-              } else {
-                static std::atomic<int> dbg_v20_f{0};
-                if (dbg_v20_f.fetch_add(1) < 4) {
-                  LOG(WARNING) << "v20: PutSignal atomicAdd kernel launch "
-                               << "failed: " << cudaGetErrorString(cerr);
-                }
-                // Fall through to old fallbacks if kernel launch fails.
-              }
-            }
-            // (legacy v18+v14 fallbacks kept for non-CUDA signal targets)
-            MemHandle* sig_mh_legacy = cc->lookup_memhandle(hdr.signal_handle);
-            sig_mh = sig_mh_legacy;
-            if (sig_mh != nullptr) {
-              uint8_t* lazy = V18LazyHostAddr(sig_mh, hdr.signal_off);
-              if (lazy != nullptr) {
-                auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(lazy);
-                absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
-                                                  hdr.signal_off));
-                uint64_t prev = *slot_u64;
-                *slot_u64 = prev + hdr.signal_val;
-                // v19: clflushopt + mfence to flush WC store buffer to PCIe
-            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
-                bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-                break;
-              }
-            }
-            if (sig_mh != nullptr && sig_mh->base != nullptr &&
-                hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
-              void* sig_dev = static_cast<uint8_t*>(sig_mh->base) +
-                              hdr.signal_off;
-              absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
-                                                hdr.signal_off));
-              uint64_t prev = 0;
-              cudaError_t cerr1 = cudaMemcpy(&prev, sig_dev,
-                                             sizeof(uint64_t),
-                                             cudaMemcpyDeviceToHost);
-              if (cerr1 != cudaSuccess) {
-                LOG(ERROR) << "v14 PutSignal D2H cudaMemcpy: "
-                           << cudaGetErrorString(cerr1);
-                SetGinError("RunInbound:PutSignal:cudaMemcpy-D2H");
-              } else {
-                uint64_t newv = prev + hdr.signal_val;
-                cudaError_t cerr2 = cudaMemcpy(sig_dev, &newv,
-                                               sizeof(uint64_t),
-                                               cudaMemcpyHostToDevice);
-                if (cerr2 != cudaSuccess) {
-                  LOG(ERROR) << "v14 PutSignal H2D cudaMemcpy: "
-                             << cudaGetErrorString(cerr2);
-                  SetGinError("RunInbound:PutSignal:cudaMemcpy-H2D");
-                } else {
-                  static std::atomic<int> dbg_v14_ps{0};
-                  int n = dbg_v14_ps.fetch_add(1);
-                  if (n < 4) {
-                    LOG(INFO) << "v14: PutSignal cudaMemcpy fallback OK "
-                              << "sig_h=" << hdr.signal_handle
-                              << " off=" << hdr.signal_off
-                              << " val+=" << hdr.signal_val
-                              << " (count #" << n << ")";
-                  }
-                }
-              }
-            } else {
-              LOG(ERROR) << "RunInbound: PutSignal no signal map "
-                            "(sig_h=" << hdr.signal_handle
-                         << " off=" << hdr.signal_off
-                         << " mh=" << (sig_mh ? "found" : "null")
-                         << " primary_size=" << cc->signal_size_bytes()
-                         << ")";
-              SetGinError("RunInbound:PutSignal:no-map");
-            }
+            LOG(ERROR) << "RunInbound: PutSignal no signal map "
+                          "(sig_h=0x" << std::hex << hdr.signal_handle
+                       << std::dec << " off=" << hdr.signal_off
+                       << " primary_size=" << cc->signal_size_bytes() << ")";
+            SetGinError("RunInbound:PutSignal:no-map");
           }
         }
         bump_commit_seq(hdr.source_rank, hdr.wire_seq);
@@ -672,92 +463,13 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           absl::MutexLock l(cc->signal_mu());
           uint64_t prev = *slot_u64;
           *slot_u64 = prev + hdr.signal_val;
-          // v19: clflushopt + mfence to flush WC store buffer to PCIe
-            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
+          __asm__ __volatile__("sfence" ::: "memory");
         } else {
-          // v20: GPU atomicAdd kernel — bypasses all host-side RMW.
-          MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
-          if (sig_mh != nullptr && (sig_mh->ptr_type & NCCL_PTR_CUDA) &&
-              sig_mh->base != nullptr &&
-              hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
-            void* sig_dev =
-                static_cast<uint8_t*>(sig_mh->base) + hdr.signal_off;
-            cudaStream_t stream = cc->signal_stream();
-            cudaError_t cerr =
-                LaunchSignalAdd(sig_dev, hdr.signal_val, stream);
-            if (cerr == cudaSuccess) {
-              cudaStreamSynchronize(stream);
-              static std::atomic<int> dbg_v20s{0};
-              int n = dbg_v20s.fetch_add(1);
-              if (n < 4) {
-                LOG(INFO) << "v20: Signal atomicAdd kernel OK "
-                          << "sig_h=" << hdr.signal_handle
-                          << " off=" << hdr.signal_off
-                          << " (count #" << n << ")";
-              }
-              bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-              break;
-            }
-          }
-          // (legacy fallbacks below for non-CUDA targets / launch failure)
-          if (sig_mh != nullptr) {
-            uint8_t* lazy = V18LazyHostAddr(sig_mh, hdr.signal_off);
-            if (lazy != nullptr) {
-              auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(lazy);
-              absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
-                                                hdr.signal_off));
-              uint64_t prev = *slot_u64;
-              *slot_u64 = prev + hdr.signal_val;
-              // v19: clflushopt + mfence to flush WC store buffer to PCIe
-            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
-              bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-              break;
-            }
-          }
-          if (sig_mh != nullptr && sig_mh->base != nullptr &&
-              hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
-            void* sig_dev = static_cast<uint8_t*>(sig_mh->base) +
-                            hdr.signal_off;
-            absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
-                                              hdr.signal_off));
-            uint64_t prev = 0;
-            cudaError_t cerr1 = cudaMemcpy(&prev, sig_dev,
-                                           sizeof(uint64_t),
-                                           cudaMemcpyDeviceToHost);
-            if (cerr1 != cudaSuccess) {
-              LOG(ERROR) << "v14 Signal D2H cudaMemcpy: "
-                         << cudaGetErrorString(cerr1);
-              SetGinError("RunInbound:Signal:cudaMemcpy-D2H");
-            } else {
-              uint64_t newv = prev + hdr.signal_val;
-              cudaError_t cerr2 = cudaMemcpy(sig_dev, &newv,
-                                             sizeof(uint64_t),
-                                             cudaMemcpyHostToDevice);
-              if (cerr2 != cudaSuccess) {
-                LOG(ERROR) << "v14 Signal H2D cudaMemcpy: "
-                           << cudaGetErrorString(cerr2);
-                SetGinError("RunInbound:Signal:cudaMemcpy-H2D");
-              } else {
-                static std::atomic<int> dbg_v14_sg{0};
-                int n = dbg_v14_sg.fetch_add(1);
-                if (n < 4) {
-                  LOG(INFO) << "v14: Signal cudaMemcpy fallback OK "
-                            << "sig_h=" << hdr.signal_handle
-                            << " off=" << hdr.signal_off
-                            << " val+=" << hdr.signal_val
-                            << " (count #" << n << ")";
-                }
-              }
-            }
-          } else {
-            LOG(ERROR) << "RunInbound: Signal no signal map (sig_h="
-                       << hdr.signal_handle
-                       << " off=" << hdr.signal_off
-                       << " mh=" << (sig_mh ? "found" : "null")
-                       << " primary_size=" << cc->signal_size_bytes()
-                       << ")";
-            SetGinError("RunInbound:Signal:no-map");
-          }
+          LOG(ERROR) << "RunInbound: Signal no signal map (sig_h=0x"
+                     << std::hex << hdr.signal_handle << std::dec
+                     << " off=" << hdr.signal_off
+                     << " primary_size=" << cc->signal_size_bytes() << ")";
+          SetGinError("RunInbound:Signal:no-map");
         }
         bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;

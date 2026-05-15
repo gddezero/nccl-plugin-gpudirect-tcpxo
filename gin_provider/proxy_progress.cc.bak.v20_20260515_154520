@@ -7,8 +7,6 @@
  */
 
 #include "gin_provider/proxy_progress.h"
-#include "plugin/nccl_net.h"
-#include "gin_provider/signal_atomic.h"
 
 #include <cuda_runtime.h>
 
@@ -561,43 +559,12 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             // v19: clflushopt + mfence to flush WC store buffer to PCIe
             __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
           } else {
-            // v20: GPU atomicAdd kernel — bypasses all host-side RMW
-            // emulation (GDR pin, cudaMemcpy fallback, lazy chunk pin).
-            // Hardware-atomic; no mutex; no BAR1 contention.
+            // v14: GDR pin missing for signal_handle (DeepEP elastic
+            // registers ~1.16 GB scratch buffers that exceed
+            // gdr_pin_buffer limit). v18: try lazy chunk-pin first
+            // for fast host-mapped RMW; only fall back to cudaMemcpy
+            // RMW if lazy pin also fails.
             MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
-            if (sig_mh != nullptr && (sig_mh->ptr_type & NCCL_PTR_CUDA) &&
-                sig_mh->base != nullptr &&
-                hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
-              void* sig_dev =
-                  static_cast<uint8_t*>(sig_mh->base) + hdr.signal_off;
-              cudaStream_t stream = cc->signal_stream();
-              cudaError_t cerr =
-                  LaunchSignalAdd(sig_dev, hdr.signal_val, stream);
-              if (cerr == cudaSuccess) {
-                cudaStreamSynchronize(stream);
-                static std::atomic<int> dbg_v20{0};
-                int n = dbg_v20.fetch_add(1);
-                if (n < 4) {
-                  LOG(INFO) << "v20: PutSignal atomicAdd kernel OK "
-                            << "sig_h=" << hdr.signal_handle
-                            << " off=" << hdr.signal_off
-                            << " val+=" << hdr.signal_val
-                            << " (count #" << n << ")";
-                }
-                bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-                break;
-              } else {
-                static std::atomic<int> dbg_v20_f{0};
-                if (dbg_v20_f.fetch_add(1) < 4) {
-                  LOG(WARNING) << "v20: PutSignal atomicAdd kernel launch "
-                               << "failed: " << cudaGetErrorString(cerr);
-                }
-                // Fall through to old fallbacks if kernel launch fails.
-              }
-            }
-            // (legacy v18+v14 fallbacks kept for non-CUDA signal targets)
-            MemHandle* sig_mh_legacy = cc->lookup_memhandle(hdr.signal_handle);
-            sig_mh = sig_mh_legacy;
             if (sig_mh != nullptr) {
               uint8_t* lazy = V18LazyHostAddr(sig_mh, hdr.signal_off);
               if (lazy != nullptr) {
@@ -675,31 +642,9 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           // v19: clflushopt + mfence to flush WC store buffer to PCIe
             __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
         } else {
-          // v20: GPU atomicAdd kernel — bypasses all host-side RMW.
+          // v14: GDR pin missing -> v18 lazy chunk pin first, then
+          // cudaMemcpy fallback.
           MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
-          if (sig_mh != nullptr && (sig_mh->ptr_type & NCCL_PTR_CUDA) &&
-              sig_mh->base != nullptr &&
-              hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
-            void* sig_dev =
-                static_cast<uint8_t*>(sig_mh->base) + hdr.signal_off;
-            cudaStream_t stream = cc->signal_stream();
-            cudaError_t cerr =
-                LaunchSignalAdd(sig_dev, hdr.signal_val, stream);
-            if (cerr == cudaSuccess) {
-              cudaStreamSynchronize(stream);
-              static std::atomic<int> dbg_v20s{0};
-              int n = dbg_v20s.fetch_add(1);
-              if (n < 4) {
-                LOG(INFO) << "v20: Signal atomicAdd kernel OK "
-                          << "sig_h=" << hdr.signal_handle
-                          << " off=" << hdr.signal_off
-                          << " (count #" << n << ")";
-              }
-              bump_commit_seq(hdr.source_rank, hdr.wire_seq);
-              break;
-            }
-          }
-          // (legacy fallbacks below for non-CUDA targets / launch failure)
           if (sig_mh != nullptr) {
             uint8_t* lazy = V18LazyHostAddr(sig_mh, hdr.signal_off);
             if (lazy != nullptr) {

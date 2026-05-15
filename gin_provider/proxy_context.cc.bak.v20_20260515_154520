@@ -241,24 +241,6 @@ uint8_t* CollComm::signal_host_addr(uint64_t signal_handle,
   return nullptr;
 }
 
-
-
-cudaStream_t CollComm::signal_stream() {
-  // v20: lazy-init under signal_mu_; CUDA streams are cheap.
-  absl::MutexLock l(&signal_mu_);
-  if (signal_stream_ == nullptr) {
-    if (dev_ >= 0) cudaSetDevice(dev_);
-    cudaError_t cerr = cudaStreamCreateWithFlags(&signal_stream_,
-                                                  cudaStreamNonBlocking);
-    if (cerr != cudaSuccess) {
-      LOG(ERROR) << "v20: cudaStreamCreate failed: "
-                 << cudaGetErrorString(cerr);
-      signal_stream_ = nullptr;
-    }
-  }
-  return signal_stream_;
-}
-
 // ---- GinCtx ----
 
 GinCtx::~GinCtx() {
