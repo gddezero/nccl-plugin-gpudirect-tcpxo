@@ -507,7 +507,8 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                 auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
                 absl::MutexLock l(cc->signal_mu());
                 *slot_u64 += hdr.signal_val;
-                __asm__ __volatile__("sfence" ::: "memory");
+                // v19: clflushopt + mfence to flush WC store buffer to PCIe
+            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
               }
             }
             bump_commit_seq(hdr.source_rank, hdr.wire_seq);
@@ -555,7 +556,8 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             absl::MutexLock l(cc->signal_mu());
             uint64_t prev = *slot_u64;
             *slot_u64 = prev + hdr.signal_val;
-            __asm__ __volatile__("sfence" ::: "memory");
+            // v19: clflushopt + mfence to flush WC store buffer to PCIe
+            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
           } else {
             // v14: GDR pin missing for signal_handle (DeepEP elastic
             // registers ~1.16 GB scratch buffers that exceed
@@ -571,7 +573,8 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                                                   hdr.signal_off));
                 uint64_t prev = *slot_u64;
                 *slot_u64 = prev + hdr.signal_val;
-                __asm__ __volatile__("sfence" ::: "memory");
+                // v19: clflushopt + mfence to flush WC store buffer to PCIe
+            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
                 bump_commit_seq(hdr.source_rank, hdr.wire_seq);
                 break;
               }
@@ -636,7 +639,8 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           absl::MutexLock l(cc->signal_mu());
           uint64_t prev = *slot_u64;
           *slot_u64 = prev + hdr.signal_val;
-          __asm__ __volatile__("sfence" ::: "memory");
+          // v19: clflushopt + mfence to flush WC store buffer to PCIe
+            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
         } else {
           // v14: GDR pin missing -> v18 lazy chunk pin first, then
           // cudaMemcpy fallback.
@@ -649,7 +653,8 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                                                 hdr.signal_off));
               uint64_t prev = *slot_u64;
               *slot_u64 = prev + hdr.signal_val;
-              __asm__ __volatile__("sfence" ::: "memory");
+              // v19: clflushopt + mfence to flush WC store buffer to PCIe
+            __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
               bump_commit_seq(hdr.source_rank, hdr.wire_seq);
               break;
             }
