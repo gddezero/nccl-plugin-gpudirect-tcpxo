@@ -226,14 +226,23 @@ uint8_t* CollComm::signal_host_addr(uint64_t signal_handle,
       }
       static std::atomic<int> dbg{0};
       if (dbg.fetch_add(1) < 8) {
-        LOG(WARNING) << "signal_host_addr: mhandle 0x" << std::hex
+        LOG(WARNING) << "v21 signal_host_addr: mhandle 0x" << std::hex
                      << signal_handle
                      << " has no GDR pin (size=" << std::dec << mh->bytes
-                     << " base=" << mh->base << "); falling back";
+                     << " base=" << mh->base
+                     << "); returning nullptr to force GPU atomicAdd path "
+                     << "(was v20 buggy fallthrough to signal_host_map_)";
       }
     }
+    // v21: do NOT fall through to signal_host_map_ here. That region is
+    // the NCCL-internal barrier signal area; writing DeepEP signal RMW
+    // there silently corrupts the wrong memory and DeepEP's
+    // net.readSignal() reads the real device slot which stays zero.
+    // Return nullptr -> caller routes to v20 GPU atomicAdd kernel which
+    // writes directly to mh->base + signal_off (the actual signal slot).
+    return nullptr;
   }
-  // Fallback: primary per-context signal buffer (NCCL barrier path).
+  // signal_handle == 0: pure NCCL-internal barrier signal path.
   if (signal_host_map_ != nullptr &&
       signal_off + sizeof(uint64_t) <= signal_size_bytes_) {
     return reinterpret_cast<uint8_t*>(signal_host_map_) + signal_off;
