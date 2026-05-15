@@ -113,6 +113,15 @@ absl::Status CollComm::Init(
     }
   }
   peers_.resize(nranks);
+  // v11: per-source-rank receive-side commit-order counters, 1-based to
+  // match PeerConn::wire_seq_next start. Allocated as a unique_ptr array
+  // because std::atomic isn't move/copy.
+  recv_commit_seq_n_ = static_cast<size_t>(nranks);
+  recv_commit_seq_ =
+      std::make_unique<std::atomic<uint64_t>[]>(recv_commit_seq_n_);
+  for (size_t i = 0; i < recv_commit_seq_n_; ++i) {
+    recv_commit_seq_[i].store(1, std::memory_order_relaxed);
+  }
   LOG(INFO) << "CollComm::Init dev=" << dev << " fastrak_idx=" << (int)fastrak_idx
             << " nic_ip=" << nic_ip_ << " rank=" << rank << "/" << nranks
             << " n_provisioned_nics=" << n_provisioned_nics_;

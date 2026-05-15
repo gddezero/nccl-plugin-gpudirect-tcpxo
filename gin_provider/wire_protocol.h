@@ -85,9 +85,20 @@ struct WireHeader {
   //   signal_off = (signal_id + ctx_id * nSignalsPerCtx) * sizeof(uint64_t).
   // Receiver does atomic_add at <signal_buffer_host_map>[signal_off / 8].
   uint64_t signal_off;
+  // v11: per-(source_rank) monotonic sequence number assigned by the sender
+  // for EVERY op to this peer. Receiver uses it to serialize the
+  // post-payload commit phase across lanes when fanout > 1: an inbound
+  // thread spin-waits until next_commit_seq[source_rank] == wire_seq before
+  // writing the signal RMW (or, for pure Iput, before bumping the seq), so
+  // a faster lane cannot let a later op's signal increment surface before
+  // an earlier op's data has landed. With fanout=1 this is a no-op (single
+  // lane already FIFO). 1-based; 0 means "no seq, skip ordering" so legacy
+  // TickOutbound senders that don't fill it stay correct.
+  uint64_t wire_seq;
+  uint8_t  pad[56];        // pad WireHeader out to 128 bytes
 };
-static_assert(sizeof(WireHeader) == 64,
-              "WireHeader must be exactly 64 bytes");
+static_assert(sizeof(WireHeader) == 128,
+              "WireHeader must be exactly 128 bytes");
 
 }  // namespace fastrak::gin
 

@@ -977,6 +977,16 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   hdr.size = size;
   hdr.signal_val = signal_val;
   hdr.signal_off = signal_off;
+  // v11: stamp a per-peer monotonic seq onto every IputCommon op. The
+  // receiver's RunInbound uses this to enforce cross-lane post-payload
+  // commit ordering when fanout > 1, so a faster lane cannot let a
+  // later op's signal RMW surface before earlier ops on other lanes
+  // have landed their data writes. Allocated AFTER lane is chosen so
+  // numbering matches the order the proxy thread issues Sends; the
+  // IputCommon path itself is single-threaded per peer in NCCL proxy
+  // mode (one proxy thread per process), so fetch_add is uncontended.
+  hdr.wire_seq =
+      peer->wire_seq_next.fetch_add(1, std::memory_order_relaxed);
 
   // Stage header in TX scratch for this peer.
   uint32_t slot_idx =

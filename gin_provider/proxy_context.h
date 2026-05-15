@@ -91,36 +91,55 @@ struct PeerConn {
   // per_nic_reg_handles for that lane.
   std::vector<int> local_nic_idx_for_lane;
   std::atomic<uint64_t> tx_seq{0};  // round-robin lane selector
+  // v11: per-peer monotonic outbound op counter, written into
+  // WireHeader.wire_seq for EVERY IputCommon op. Receiver uses this to
+  // serialize signal-commit ordering across fanout lanes (a later op's
+  // signal cannot surface until earlier ops on other lanes have committed
+  // their data writes). 1-based on the wire (0 means "no seq, no ordering").
+  std::atomic<uint64_t> wire_seq_next{1};
   PeerConn() = default;
   PeerConn(const PeerConn&) = delete;
   PeerConn& operator=(const PeerConn&) = delete;
   PeerConn(PeerConn&& o) noexcept
       : send_socks(std::move(o.send_socks)),
         local_nic_idx_for_lane(std::move(o.local_nic_idx_for_lane)),
-        tx_seq(o.tx_seq.load(std::memory_order_relaxed)) {}
+        tx_seq(o.tx_seq.load(std::memory_order_relaxed)),
+        wire_seq_next(o.wire_seq_next.load(std::memory_order_relaxed)) {}
   PeerConn& operator=(PeerConn&& o) noexcept {
     send_socks = std::move(o.send_socks);
     local_nic_idx_for_lane = std::move(o.local_nic_idx_for_lane);
     tx_seq.store(o.tx_seq.load(std::memory_order_relaxed),
                  std::memory_order_relaxed);
+    wire_seq_next.store(o.wire_seq_next.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
     return *this;
   }
 };
 
 // Default fan-out per peer; can be overridden via NCCL_GIN_FANOUT env var.
 // v10 investigation (2026-05-15): tried raising default 1 -> 3 to capture
-// the +54% PP 4096x7168 conc=3 hide=1 bandwidth gain (~35 -> ~54 GB/s on
-// 3 default-config runs; FANOUT=1/2/3 explicit runs reproduced v9
-// numbers). REVERTED because num_stress_iterations=100 reproducibly
-// corrupts data at fanout>1: v10 fanout=3 mismatch at seed=6, fanout=2 at
-// seed=8, and v9 fanout=3 at seed=14 (CUDA launch failure / torch.equal
-// mismatch). Single-iter stress and short PP profiling never expose this.
-// Until the multi-socket fan-out send path is fixed (suspect: per-socket
-// tx_seq / inbound reassembly race surfaces only after ~6+ stress
-// generations of repeated context teardown/setup), fanout>1 stays opt-in
-// for short-lived benchmark runs. Small-tensor / latency-bound paths
-// were not the limiting factor on the default change.
-constexpr int kDefaultFanout = 1;
+// the +54% PP 4096x7168 conc=3 hide=1 bandwidth gain (~35 -> ~54 GB/s).
+// REVERTED at v10 because num_stress_iterations=100 reproducibly corrupted
+// data at fanout > 1: v10 fanout=3 mismatch at seed=6, fanout=2 at seed=8,
+// v9 fanout=3 at seed=14. Root cause was a cross-lane signal-ordering
+// race: with fanout > 1, three concurrent IputSignal ops stripe across
+// three lanes; each receiver inbound thread does
+// `data RecvLinearized -> signal RMW (signal++)` independently, so a
+// faster lane can publish a later op's signal increment before an earlier
+// op on a slower lane has finished its data DMA. The DeepEP/NCCL consumer
+// reads a slot indexed by `recv_count % inflight` and trusts that signal
+// == recv_count + 1 means slot N is filled — but the signal has advanced
+// by a different lane that filled a DIFFERENT slot.
+// v11 fix (this iteration): WireHeader gains a `wire_seq` field stamped
+// monotonically per peer at the sender, and CollComm gains a per-source
+// atomic `recv_commit_seq` array. RunInbound spin-waits on
+// recv_commit_seq[src] == hdr.wire_seq before applying signal RMW (and
+// bumps it after), so signal commits are serialized across lanes per
+// source rank. Payload Recv still happens in parallel — only the
+// post-Recv commit step is ordered. PP 4096x7168 conc=3 hide=1
+// stress=100 now passes at fanout=3 (v11.md). With ordering safe,
+// kDefaultFanout flipped 1 -> 3 to capture the +54% gain by default.
+constexpr int kDefaultFanout = 3;
 int FanoutPerPeer();
 
 // v9: multi-NIC fan-out is OFF by default. When ON, Listen opens kMaxNics
@@ -254,6 +273,22 @@ class CollComm {
   // reduction) without needing PCIe atomics. ~30ns per call.
   absl::Mutex* signal_mu() { return &signal_mu_; }
 
+  // v11: per-source-rank "next seq to commit" counter. The receiver uses
+  // this to enforce cross-lane post-payload ordering when fanout > 1: an
+  // inbound thread receives op with hdr.wire_seq==S, finishes the payload
+  // RecvLinearized, then spin-waits until next_commit_seq[src]==S before
+  // writing the signal RMW (or, for pure Iput, just bumping the counter).
+  // This ensures a faster lane cannot let a later op's signal surface
+  // before earlier ops on other lanes have landed their data. Counter is
+  // 1-based; matches the sender's PeerConn::wire_seq_next start value.
+  // Returns nullptr for out-of-range src.
+  std::atomic<uint64_t>* recv_commit_seq(int src_rank) {
+    if (src_rank < 0 || src_rank >= static_cast<int>(recv_commit_seq_n_) ||
+        recv_commit_seq_ == nullptr)
+      return nullptr;
+    return &recv_commit_seq_[src_rank];
+  }
+
   // v6 (S7): GinCtx instances register themselves so ~CollComm can stop
   // their progress threads BEFORE the CollComm's sockets / mhandle map
   // are destroyed. Without this the progress thread can dereference
@@ -302,6 +337,12 @@ class CollComm {
 
   // v7 (S3): see signal_mu() comment above.
   absl::Mutex signal_mu_;
+
+  // v11: per-source-rank receive-side commit-order counter. Sized to
+  // nranks_ in Init. std::atomic isn't move/copy, so we hold them in a
+  // unique_ptr array. Inbound threads read recv_commit_seq_[src_rank].
+  std::unique_ptr<std::atomic<uint64_t>[]> recv_commit_seq_;
+  size_t recv_commit_seq_n_ = 0;
 };
 
 // Per createContext() instance: owns the GPU-visible proxy context and the

@@ -343,6 +343,38 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                 << " sig_val=" << hdr.signal_val;
     }
 
+    // v11: cross-lane commit-order gate. Every IputCommon op stamps
+    // hdr.wire_seq from a per-peer monotonic counter. For ops where order
+    // matters w.r.t. signal visibility (PutSignal / Signal), we must wait
+    // until ALL prior ops from the same source rank have committed before
+    // we apply the signal RMW — otherwise a faster lane can leak a later
+    // op's signal increment ahead of an earlier op's data write, and the
+    // consumer reads stale memory. Pure Iput (no signal) needs to bump the
+    // counter too so subsequent signals don't get stuck. Track the highest
+    // wire_seq this thread has fully processed locally (not strictly
+    // needed, but lets us short-circuit when the seq is in order).
+    //
+    // wire_seq == 0 means the sender did not assign a seq (legacy
+    // TickOutbound path); skip ordering for those.
+    auto wait_for_commit_turn = [cc](uint32_t src, uint64_t seq) {
+      if (seq == 0) return;
+      auto* atom = cc->recv_commit_seq(static_cast<int>(src));
+      if (atom == nullptr) return;
+      uint32_t spins = 0;
+      while (atom->load(std::memory_order_acquire) != seq) {
+        if ((++spins & 4095) == 0) std::this_thread::yield();
+      }
+    };
+    auto bump_commit_seq = [cc](uint32_t src, uint64_t seq) {
+      if (seq == 0) return;
+      auto* atom = cc->recv_commit_seq(static_cast<int>(src));
+      if (atom == nullptr) return;
+      // Sanity: only this thread sees this exact wire_seq (sender allocates
+      // them monotonically and routes one to a single lane), so a plain
+      // store to seq+1 is enough.
+      atom->store(seq + 1, std::memory_order_release);
+    };
+
     switch (hdr.op) {
       case kWireOpPut:
       case kWireOpPutSignal: {
@@ -391,6 +423,10 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                       << std::dec;
           }
         }
+        // v11: cross-lane gate AFTER payload Recv, BEFORE signal RMW (or
+        // before bumping the seq for pure Puts). Lanes complete payloads
+        // in parallel; only the post-commit step is serialized.
+        wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
         if (hdr.op == kWireOpPutSignal) {
           // v7 (S3 fix): per-CollComm signal_mu_ serialises the
           // load+store+sfence RMW. The slot lives in GDR write-
@@ -413,9 +449,12 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             SetGinError("RunInbound:PutSignal:no-map");
           }
         }
+        bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;
       }
       case kWireOpSignal: {
+        // v11: standalone Signal carries no payload; gate before RMW.
+        wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
         // v7 (S3 fix): same per-CollComm signal_mu_ as PutSignal above.
         uint8_t* slot_b =
             cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
@@ -432,15 +471,21 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                      << " primary_size=" << cc->signal_size_bytes() << ")";
           SetGinError("RunInbound:Signal:no-map");
         }
+        bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;
       }
       case kWireOpFlush:
         // Marker only — flush is initiated by source's progress thread.
+        // Still bump seq so subsequent ops aren't stuck.
+        wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+        bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;
       case kWireOpGet:
       case kWireOpGetReply:
         // TODO(M3.1): Get path. Skipped for the first MVP.
         LOG(WARNING) << "RunInbound: WireOpGet not yet implemented";
+        wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+        bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;
       default:
         LOG(ERROR) << "RunInbound: unknown WireOp " << hdr.op;

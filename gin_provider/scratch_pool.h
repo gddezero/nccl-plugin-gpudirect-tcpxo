@@ -40,7 +40,7 @@ namespace fastrak::gin {
 // per_nic_reg_handles[i] with an i-bound dxs::SendSocket.
 constexpr int kMaxNics = 8;
 
-constexpr size_t kWireHeaderSize = 64;
+constexpr size_t kWireHeaderSize = 128;  // v11: bumped 64 → 128 to fit wire_seq
 // M6: bumped from 32 → 1024 because we removed the synchronous hdr Send
 // DONE wait in IputCommon — without that wait, the next Iput would wrap
 // the per-peer ring before the previous Send had drained the slot. 1024
