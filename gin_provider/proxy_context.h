@@ -172,6 +172,13 @@ class CollComm {
   // signal buffer (for NCCL barrier path back-compat).
   uint8_t* signal_host_addr(uint64_t signal_handle, uint64_t signal_off);
 
+  // v7 (S3): mutex serialising load+store+sfence RMW on signal slots.
+  // The slots live in GDR write-combining memory where __atomic_fetch_add
+  // does not become visible to the GPU view (v6 attempt failed). Mutex
+  // makes multi-writer accumulation correct (DeepEP dispatch's N->1
+  // reduction) without needing PCIe atomics. ~30ns per call.
+  absl::Mutex* signal_mu() { return &signal_mu_; }
+
   // v6 (S7): GinCtx instances register themselves so ~CollComm can stop
   // their progress threads BEFORE the CollComm's sockets / mhandle map
   // are destroyed. Without this the progress thread can dereference
@@ -208,6 +215,9 @@ class CollComm {
   // ~CollComm to stop their progress threads before tearing down sockets.
   absl::Mutex ctx_mu_;
   std::vector<GinCtx*> ctxs_ ABSL_GUARDED_BY(ctx_mu_);
+
+  // v7 (S3): see signal_mu() comment above.
+  absl::Mutex signal_mu_;
 };
 
 // Per createContext() instance: owns the GPU-visible proxy context and the

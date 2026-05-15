@@ -373,19 +373,16 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           }
         }
         if (hdr.op == kWireOpPutSignal) {
-          // v6 (S3 partial): the original review flagged this as
-          // non-atomic RMW; we kept the v5 single-writer-per-slot
-          // pattern (load+store+sfence) because __atomic_fetch_add over
-          // a GDR write-combining mapping was observed to not commit
-          // visibly to the GPU view in our test setup. For NCCL barrier
-          // (single sender per slot) and PP (per-rank slot ownership)
-          // this is safe; DeepEP dispatch reduction (N->1 accumulation)
-          // is still a correctness risk and should be re-checked when
-          // we add per-CollComm signal_write_mu_ or move to PCIe atomic.
+          // v7 (S3 fix): per-CollComm signal_mu_ serialises the
+          // load+store+sfence RMW. The slot lives in GDR write-
+          // combining memory; LOCK XADD does not commit visibly to the
+          // GPU view (v6 attempt failed). Mutex makes multi-writer
+          // accumulation correct (DeepEP dispatch's N->1 reduction).
           uint8_t* slot_b =
               cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
           if (slot_b != nullptr) {
             auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
+            absl::MutexLock l(cc->signal_mu());
             uint64_t prev = *slot_u64;
             *slot_u64 = prev + hdr.signal_val;
             __asm__ __volatile__("sfence" ::: "memory");
@@ -400,11 +397,12 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
         break;
       }
       case kWireOpSignal: {
-        // v6 (S3 partial): same v5 RMW pattern as PutSignal above.
+        // v7 (S3 fix): same per-CollComm signal_mu_ as PutSignal above.
         uint8_t* slot_b =
             cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
         if (slot_b != nullptr) {
           auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
+          absl::MutexLock l(cc->signal_mu());
           uint64_t prev = *slot_u64;
           *slot_u64 = prev + hdr.signal_val;
           __asm__ __volatile__("sfence" ::: "memory");

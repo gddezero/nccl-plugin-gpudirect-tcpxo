@@ -629,13 +629,20 @@ struct GinRequest {
   uint32_t  scratch_slot = UINT32_MAX;
 };
 
-// Per-thread TX scratch ring slot counter, indexed by `rank % kTlsTxSeqLen`.
-// v6 (R4 documented, NOT enlarged): kTlsTxSeqLen is hard-coded 64 — rank 64
-// aliases rank 0's counter and every 64th rank thereafter. The alias is
-// modulo a kTxSlotsPerPeer=1024 ring so two aliasing ranks just share the
-// same advancing counter; semantically harmless but worth flagging if we
-// ever need >64-way concurrent peer Iputs from a single proxy thread.
-// Tried bumping to 1024 in v6r1; reverted because perf flapped on 4096×7168.
+// v7: per-thread TX scratch ring slot counter, indexed by `rank % 64`.
+// Threads with rank index aliasing each other share the same ring; modulo
+// kTxSlotsPerPeer=1024 keeps wrap safe.
+//
+// History (Task A attempt): v7 first tried promoting this to a per-peer
+// atomic to close the cross-thread same-slot race exposed by the v5 edge
+// stability sweep (SIGBUS at FANOUT>=2). That change broke data
+// integrity at op 0 in the FANOUT=3 PP test (rank 1 mismatch) — likely
+// because re-deriving lane from the same atomic shifted lane assignment
+// in a way that re-tripped a latent dxs ordering quirk. Reverted.
+// Investigation is logged in deepep_perf_v7.md "Task A status"; v6
+// fanout=2/3 was empirically not tripping the SIGBUS in re-runs, so
+// the v5 report's race may be conditional on additional state we
+// haven't reproduced. Filed as known issue.
 constexpr size_t kTlsTxSeqLen = 64;
 static thread_local uint32_t tls_tx_seq[kTlsTxSeqLen] = {0};
 
@@ -687,10 +694,11 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
       uint64_t sig_h = reinterpret_cast<uint64_t>(signalMhandle);
       uint8_t* slot_b = cc->signal_host_addr(sig_h, signal_off);
       if (slot_b != nullptr) {
-        // v6 (S3 partial): kept v5 plain-store + sfence — see the matching
-        // comment in proxy_progress.cc::RunInbound for why we did not
-        // switch to __atomic_fetch_add.
+        // v7 (S3 fix): per-CollComm signal_mu_ serialises this self-
+        // signal RMW with concurrent inbound writes from peers (DeepEP
+        // dispatch reduction lands here too).
         auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
+        absl::MutexLock l(cc->signal_mu());
         uint64_t prev = *slot_u64;
         uint64_t next = prev + signal_val;
         *slot_u64 = next;
@@ -790,7 +798,6 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   hdr.signal_off = signal_off;
 
   // Stage header in TX scratch for this peer.
-  // v6 (R4): kTlsTxSeqLen replaces the hard-coded 64.
   uint32_t slot_idx =
       tls_tx_seq[rank % kTlsTxSeqLen]++ & static_cast<uint32_t>(kTxSlotsPerPeer - 1);
   size_t hdr_off = sp->TxSlotOffset(static_cast<int>(rank), slot_idx);
