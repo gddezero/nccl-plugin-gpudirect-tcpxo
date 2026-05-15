@@ -18,6 +18,8 @@
 #include <thread>
 
 #include "absl/log/log.h"
+#include "gin_provider/gdr_helper.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -251,6 +253,73 @@ constexpr size_t kV16SignalShards = 64;
 absl::Mutex& V16SignalShard(uint64_t signal_handle, uint64_t signal_off) {
   static absl::Mutex shards[kV16SignalShards];
   return shards[(signal_handle ^ signal_off) & (kV16SignalShards - 1)];
+}
+
+// v18: lazy chunked GDR pin to serve PutSignal/Signal RMW for buffers
+// that exceeded the upfront GDR pin cap. Keys: (mh*, chunk_off). Pins
+// 1 MiB chunks on demand and caches forever (until plugin shutdown).
+constexpr size_t kV18ChunkBits = 20;        // 1 MiB chunks
+constexpr size_t kV18ChunkSize = 1ull << kV18ChunkBits;
+constexpr size_t kV18ChunkMask = kV18ChunkSize - 1;
+struct V18ChunkKey {
+  MemHandle* mh;
+  size_t chunk_off;
+  bool operator==(const V18ChunkKey& o) const {
+    return mh == o.mh && chunk_off == o.chunk_off;
+  }
+  template <typename H>
+  friend H AbslHashValue(H h, const V18ChunkKey& k) {
+    return H::combine(std::move(h), reinterpret_cast<uintptr_t>(k.mh),
+                      k.chunk_off);
+  }
+};
+absl::Mutex& V18ChunkMu() { static absl::Mutex mu; return mu; }
+absl::flat_hash_map<V18ChunkKey, std::shared_ptr<GdrPinnedRegion>>&
+V18ChunkMap() {
+  static auto* m = new absl::flat_hash_map<
+      V18ChunkKey, std::shared_ptr<GdrPinnedRegion>>;
+  return *m;
+}
+// Returns host VA for the (mh, off) signal slot, lazily pinning a
+// chunk if not yet cached. Returns nullptr on pin failure.
+uint8_t* V18LazyHostAddr(MemHandle* mh, size_t off) {
+  if (mh == nullptr || mh->base == nullptr) return nullptr;
+  if (!GdrAvailable()) return nullptr;
+  size_t chunk_off = off & ~kV18ChunkMask;
+  size_t chunk_size = std::min(kV18ChunkSize, mh->bytes - chunk_off);
+  std::shared_ptr<GdrPinnedRegion> chunk;
+  {
+    absl::MutexLock l(&V18ChunkMu());
+    auto key = V18ChunkKey{mh, chunk_off};
+    auto it = V18ChunkMap().find(key);
+    if (it != V18ChunkMap().end()) {
+      chunk = it->second;
+    } else {
+      void* chunk_base = static_cast<uint8_t*>(mh->base) + chunk_off;
+      auto pin_or = GdrPinnedRegion::Create(chunk_base, chunk_size);
+      if (pin_or.ok()) {
+        chunk = std::make_shared<GdrPinnedRegion>(std::move(*pin_or));
+        V18ChunkMap()[key] = chunk;
+        static std::atomic<int> dbg{0};
+        int n = dbg.fetch_add(1);
+        if (n < 8) {
+          LOG(INFO) << "v18: lazy chunk pin OK mh=" << mh
+                    << " chunk_off=" << chunk_off
+                    << " size=" << chunk_size << " (count #" << n << ")";
+        }
+      } else {
+        static std::atomic<int> dbg_f{0};
+        if (dbg_f.fetch_add(1) < 4) {
+          LOG(WARNING) << "v18: lazy chunk pin FAILED mh=" << mh
+                       << " chunk_off=" << chunk_off
+                       << " size=" << chunk_size << ": "
+                       << pin_or.status();
+        }
+        return nullptr;
+      }
+    }
+  }
+  return static_cast<uint8_t*>(chunk->host_map()) + (off - chunk_off);
 }
 }  // namespace
 
@@ -490,12 +559,23 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           } else {
             // v14: GDR pin missing for signal_handle (DeepEP elastic
             // registers ~1.16 GB scratch buffers that exceed
-            // gdr_pin_buffer limit). Fall back to D2H->RMW->H2D via
-            // cudaMemcpy on the GPU device pointer.  Holds signal_mu_
-            // across the whole RMW so concurrent local PutSignal/Signal
-            // landings see consistent updates; cross-node ordering is
-            // already serialized by wire_seq + commit_seq gate above.
+            // gdr_pin_buffer limit). v18: try lazy chunk-pin first
+            // for fast host-mapped RMW; only fall back to cudaMemcpy
+            // RMW if lazy pin also fails.
             MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
+            if (sig_mh != nullptr) {
+              uint8_t* lazy = V18LazyHostAddr(sig_mh, hdr.signal_off);
+              if (lazy != nullptr) {
+                auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(lazy);
+                absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
+                                                  hdr.signal_off));
+                uint64_t prev = *slot_u64;
+                *slot_u64 = prev + hdr.signal_val;
+                __asm__ __volatile__("sfence" ::: "memory");
+                bump_commit_seq(hdr.source_rank, hdr.wire_seq);
+                break;
+              }
+            }
             if (sig_mh != nullptr && sig_mh->base != nullptr &&
                 hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
               void* sig_dev = static_cast<uint8_t*>(sig_mh->base) +
@@ -558,8 +638,22 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           *slot_u64 = prev + hdr.signal_val;
           __asm__ __volatile__("sfence" ::: "memory");
         } else {
-          // v14: GDR pin missing -> cudaMemcpy fallback (see PutSignal).
+          // v14: GDR pin missing -> v18 lazy chunk pin first, then
+          // cudaMemcpy fallback.
           MemHandle* sig_mh = cc->lookup_memhandle(hdr.signal_handle);
+          if (sig_mh != nullptr) {
+            uint8_t* lazy = V18LazyHostAddr(sig_mh, hdr.signal_off);
+            if (lazy != nullptr) {
+              auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(lazy);
+              absl::MutexLock l(&V16SignalShard(hdr.signal_handle,
+                                                hdr.signal_off));
+              uint64_t prev = *slot_u64;
+              *slot_u64 = prev + hdr.signal_val;
+              __asm__ __volatile__("sfence" ::: "memory");
+              bump_commit_seq(hdr.source_rank, hdr.wire_seq);
+              break;
+            }
+          }
           if (sig_mh != nullptr && sig_mh->base != nullptr &&
               hdr.signal_off + sizeof(uint64_t) <= sig_mh->bytes) {
             void* sig_dev = static_cast<uint8_t*>(sig_mh->base) +
