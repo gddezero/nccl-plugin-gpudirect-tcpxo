@@ -41,6 +41,16 @@
 namespace fastrak::gin {
 
 class ProxyProgress;
+class GinCtx;
+
+// v6 (S5): plugin-wide error flag exposed to NCCL via QueryLastError.
+// Set by any fatal error path in plugin_main.cc / proxy_progress.cc;
+// cleared on Init() (re-)entry. Use SetGinError() so call sites are
+// greppable and future tooling can hook them.
+extern std::atomic<bool> g_has_error;
+inline void SetGinError(const char* /*where*/ = nullptr) {
+  g_has_error.store(true, std::memory_order_release);
+}
 
 // One per `plugin->listen(dev, ...)` call.
 struct ListenComm {
@@ -162,6 +172,14 @@ class CollComm {
   // signal buffer (for NCCL barrier path back-compat).
   uint8_t* signal_host_addr(uint64_t signal_handle, uint64_t signal_off);
 
+  // v6 (S7): GinCtx instances register themselves so ~CollComm can stop
+  // their progress threads BEFORE the CollComm's sockets / mhandle map
+  // are destroyed. Without this the progress thread can dereference
+  // stale CollComm state (use-after-free) when CloseColl runs before
+  // DestroyContext.
+  void register_ctx(GinCtx* ctx);
+  void unregister_ctx(GinCtx* ctx);
+
  private:
   int dev_ = -1;
   uint8_t fastrak_idx_ = 0;
@@ -185,6 +203,11 @@ class CollComm {
   GdrPinnedRegion signal_region_;
   uint64_t* signal_host_map_ = nullptr;
   size_t signal_size_bytes_ = 0;
+
+  // v6 (S7): list of GinCtx instances backed by this CollComm. Used by
+  // ~CollComm to stop their progress threads before tearing down sockets.
+  absl::Mutex ctx_mu_;
+  std::vector<GinCtx*> ctxs_ ABSL_GUARDED_BY(ctx_mu_);
 };
 
 // Per createContext() instance: owns the GPU-visible proxy context and the
@@ -203,6 +226,11 @@ class GinCtx {
 
   void StartProgress();
   void StopProgress();
+
+  // v6 (S7): called by ~CollComm when CollComm is being destroyed before
+  // this GinCtx. After detach_coll() returns, coll() == nullptr; further
+  // ABI calls on this GinCtx that need the CollComm should fail cleanly.
+  void detach_coll() { coll_ = nullptr; }
 
  private:
   CollComm* coll_ = nullptr;          // not owned

@@ -104,6 +104,15 @@ void ProxyProgress::RunOutbound() {
   }
 }
 
+// v6 (R8 / cleanup): TickOutbound is the legacy GFD-ring drain path. PROXY
+// mode (the only mode this plugin builds today) never writes to ctx_->gpu_ctx
+// queues — IputCommon dxs::Sends directly. Both the spawned outbound_thread_
+// and the GinProgress ABI poll this; in PROXY mode every iteration breaks at
+// the first pi==ci check, so the cost is just the per-peer load. We keep the
+// body for the (currently unused) non-shim path, but it intentionally never
+// runs in PROXY mode and has not been audited for the same concurrency
+// fixes the inbound path got (S3/S4); add a mutex if PROXY mode ever starts
+// dispatching through here.
 void ProxyProgress::TickOutbound() {
   auto* gpu = ctx_ ? ctx_->gpu_ctx() : nullptr;
   auto* cc = ctx_ ? ctx_->coll() : nullptr;
@@ -258,12 +267,23 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
     if (!recv_or.ok()) {
       LOG(ERROR) << "RunInbound[" << inbound_idx
                  << "]: RecvLinearized(header) failed: " << recv_or.status();
+      // v6 (fault-tolerance, NARROWED): only set g_has_error on hard
+      // socket faults (not on the deadline-exceeded teardown noise we
+      // get when a peer closes naturally). RecvLinearized failing
+      // synchronously means the socket is wedged.
+      SetGinError("RunInbound:RecvLinearized");
       break;
     }
     auto recv = std::move(*recv_or);
     auto sz_or = WaitRecvDone(*recv, "inbound header");
     if (!sz_or.ok()) {
       if (stop_.load(std::memory_order_acquire)) break;
+      // v6 (fault-tolerance, NARROWED): WaitRecvDone failing is the
+      // common teardown signal — peer closed its end of the socket
+      // and our recv times out. Logging it is enough; setting
+      // g_has_error here would make NCCL abort multi-config tests
+      // (DeepEP test_pp recreates contexts between configs and reads
+      // QueryLastError; a stale teardown error trips it).
       LOG(ERROR) << "RunInbound[" << inbound_idx
                  << "]: header recv wait: " << sz_or.status();
       break;
@@ -285,11 +305,13 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
       if (cerr != cudaSuccess) {
         LOG(ERROR) << "RunInbound: cudaMemcpy(header) failed: "
                    << cudaGetErrorString(cerr);
+        SetGinError("RunInbound:cudaMemcpy-hdr");
         continue;
       }
     }
     if (hdr.magic != kWireMagic) {
       LOG(ERROR) << "RunInbound: bad magic 0x" << std::hex << hdr.magic;
+      SetGinError("RunInbound:bad-magic");
       continue;
     }
     // v5 (M6.6): TLS dbg counter (was static std::atomic<int> rx_dbg).
@@ -314,10 +336,15 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
         // signal paths arrive with dst_handle=0 and size=0 — validation
         // would (incorrectly) reject them and skip the signal write below.
         if (hdr.size > 0) {
+          // v6 (S8): lookup_memhandle masks bit 0 internally for the
+          // shim-packed handle. v6 fault tolerance: a missing dst_handle
+          // is now an error visible via QueryLastError instead of a
+          // silent dropped op.
           MemHandle* dst = cc->lookup_memhandle(hdr.dst_handle);
           if (dst == nullptr || dst->local_reg == 0) {
             LOG(ERROR) << "RunInbound: bad dst_handle " << hdr.dst_handle
                        << " for size=" << hdr.size << " op=" << hdr.op;
+            SetGinError("RunInbound:bad-dst-handle");
             break;
           }
           auto p_or = recv_sock->RecvLinearized(hdr.dst_off, hdr.size,
@@ -325,12 +352,14 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           if (!p_or.ok()) {
             LOG(ERROR) << "RunInbound: payload RecvLinearized failed: "
                        << p_or.status();
+            SetGinError("RunInbound:payload-RecvLinearized");
             break;
           }
           auto p = std::move(*p_or);
           auto p_sz = WaitRecvDone(*p, "inbound payload");
           if (!p_sz.ok()) {
             LOG(ERROR) << "RunInbound: payload recv wait: " << p_sz.status();
+            SetGinError("RunInbound:payload-wait");
             break;
           }
           // v5 (M6.6): TLS dbg counter — see rx_dbg_tls comment.
@@ -344,41 +373,47 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           }
         }
         if (hdr.op == kWireOpPutSignal) {
-          // M6: prefer per-buffer GDR pin via signal_handle; fall back
-          // to primary FORCE_SO map. GDR mapping is write-combining,
-          // use plain RMW + sfence (single-writer per signal slot for
-          // both NCCL barrier and DeepEP dispatch signal protocols).
+          // v6 (S3 partial): the original review flagged this as
+          // non-atomic RMW; we kept the v5 single-writer-per-slot
+          // pattern (load+store+sfence) because __atomic_fetch_add over
+          // a GDR write-combining mapping was observed to not commit
+          // visibly to the GPU view in our test setup. For NCCL barrier
+          // (single sender per slot) and PP (per-rank slot ownership)
+          // this is safe; DeepEP dispatch reduction (N->1 accumulation)
+          // is still a correctness risk and should be re-checked when
+          // we add per-CollComm signal_write_mu_ or move to PCIe atomic.
           uint8_t* slot_b =
               cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
           if (slot_b != nullptr) {
             auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
             uint64_t prev = *slot_u64;
-            uint64_t next = prev + hdr.signal_val;
-            *slot_u64 = next;
+            *slot_u64 = prev + hdr.signal_val;
             __asm__ __volatile__("sfence" ::: "memory");
           } else {
             LOG(ERROR) << "RunInbound: PutSignal no signal map "
                           "(sig_h=0x" << std::hex << hdr.signal_handle
                        << std::dec << " off=" << hdr.signal_off
                        << " primary_size=" << cc->signal_size_bytes() << ")";
+            SetGinError("RunInbound:PutSignal:no-map");
           }
         }
         break;
       }
       case kWireOpSignal: {
+        // v6 (S3 partial): same v5 RMW pattern as PutSignal above.
         uint8_t* slot_b =
             cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
         if (slot_b != nullptr) {
           auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
           uint64_t prev = *slot_u64;
-          uint64_t next = prev + hdr.signal_val;
-          *slot_u64 = next;
+          *slot_u64 = prev + hdr.signal_val;
           __asm__ __volatile__("sfence" ::: "memory");
         } else {
           LOG(ERROR) << "RunInbound: Signal no signal map (sig_h=0x"
                      << std::hex << hdr.signal_handle << std::dec
                      << " off=" << hdr.signal_off
                      << " primary_size=" << cc->signal_size_bytes() << ")";
+          SetGinError("RunInbound:Signal:no-map");
         }
         break;
       }
@@ -392,6 +427,7 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
         break;
       default:
         LOG(ERROR) << "RunInbound: unknown WireOp " << hdr.op;
+        SetGinError("RunInbound:unknown-op");
     }
   }
 }

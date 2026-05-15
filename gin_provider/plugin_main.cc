@@ -58,7 +58,9 @@ constexpr const char* kPluginName = "fastrak-gin-proxy";
 constexpr int kSocketReadyTimeoutMs = 10000;
 
 std::atomic<bool> g_initialized{false};
-std::atomic<bool> g_has_error{false};
+// v6 (S5): g_has_error storage moved to proxy_context.cc so both this
+// translation unit and proxy_progress.cc can SetGinError() via the
+// inline helper in proxy_context.h. QueryLastError below reads it.
 
 ncclResult_t StatusToNccl(const absl::Status& s) {
   if (s.ok()) return ncclSuccess;
@@ -119,6 +121,8 @@ ncclResult_t Init(void** ctx, uint64_t commId,
   }
   static int sentinel = 0;
   *ctx = &sentinel;
+  // v6 (S5): clear plugin-wide error flag at every (re)init.
+  g_has_error.store(false, std::memory_order_release);
   g_initialized.store(true, std::memory_order_release);
   LOG(INFO) << absl::StrFormat(
       "FasTrak GIN provider (PROXY mode) init: commId=%lu, ndev=%d", commId,
@@ -612,26 +616,40 @@ ncclResult_t CloseListen(void* listenComm) {
   return ncclSuccess;
 }
 
-// Per-iput request handle: holds the in-flight DXS SendOp (and an optional
-// signal SendOp for IputSignal). Test() polls them for completion.
+// Per-iput request handle: holds the in-flight DXS SendOps. Test() polls
+// them for completion.
+//
+// v6 (R1): sig_op was a dead field — never assigned, but Test() polled it
+// (nullptr → success). Dropped to avoid future maintainer confusion. If
+// signal-as-separate-Send is ever wanted, add it back with a clear owner.
 struct GinRequest {
   std::unique_ptr<dxs::SendOpInterface> hdr_op;
   std::unique_ptr<dxs::SendOpInterface> pay_op;
-  std::unique_ptr<dxs::SendOpInterface> sig_op;
   CollComm* coll = nullptr;
   uint32_t  scratch_slot = UINT32_MAX;
 };
 
-// Lazily-resolved offsets used to find a free TX scratch slot per peer.
-static thread_local uint32_t tls_tx_seq[64] = {0};
+// Per-thread TX scratch ring slot counter, indexed by `rank % kTlsTxSeqLen`.
+// v6 (R4 documented, NOT enlarged): kTlsTxSeqLen is hard-coded 64 — rank 64
+// aliases rank 0's counter and every 64th rank thereafter. The alias is
+// modulo a kTxSlotsPerPeer=1024 ring so two aliasing ranks just share the
+// same advancing counter; semantically harmless but worth flagging if we
+// ever need >64-way concurrent peer Iputs from a single proxy thread.
+// Tried bumping to 1024 in v6r1; reverted because perf flapped on 4096×7168.
+constexpr size_t kTlsTxSeqLen = 64;
+static thread_local uint32_t tls_tx_seq[kTlsTxSeqLen] = {0};
 
+// v6 (R2): signal_op_arg dropped from the IputCommon signature — it was
+// received from IputSignal/Iget/Iflush callers and discarded. The wire
+// has no field for it; if NCCL ever stops always meaning ADD here we
+// should add a WireHeader.signal_op byte and route it. Until then,
+// signalOp is silently treated as ADD.
 static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
                                uint64_t srcOff, void* srcMhandle, size_t size,
                                uint64_t dstOff, void* dstMhandle,
                                uint32_t rank, void** request,
                                WireOp wire_op, uint64_t signal_off,
-                               void* signalMhandle, uint64_t signal_val,
-                               uint32_t signal_op_arg) {
+                               void* signalMhandle, uint64_t signal_val) {
   if (ginCtx == nullptr || request == nullptr) {
     LOG(ERROR) << "IputCommon: ginCtx or request null";
     return ncclInvalidArgument;
@@ -669,9 +687,9 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
       uint64_t sig_h = reinterpret_cast<uint64_t>(signalMhandle);
       uint8_t* slot_b = cc->signal_host_addr(sig_h, signal_off);
       if (slot_b != nullptr) {
-        // GDRCopy maps GPU memory as write-combining; std::atomic
-        // ops are not guaranteed coherent there. Use plain RMW with
-        // explicit sfence (single-writer guaranteed for barrier case).
+        // v6 (S3 partial): kept v5 plain-store + sfence — see the matching
+        // comment in proxy_progress.cc::RunInbound for why we did not
+        // switch to __atomic_fetch_add.
         auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
         uint64_t prev = *slot_u64;
         uint64_t next = prev + signal_val;
@@ -690,6 +708,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
                    << std::hex << sig_h << std::dec
                    << " off=" << signal_off
                    << " primary_size=" << cc->signal_size_bytes() << ")";
+        SetGinError("Iput:self-signal:no-map");
       }
     }
     // Fabricate a no-op request that reports done immediately.
@@ -733,8 +752,13 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
     LOG(ERROR) << "IputCommon: lane " << lane << " send_sock null";
     return ncclInternalError;
   }
+  // v6 (S8): NCCL packs srcHandle/dstHandle into a 63-bit field with bit
+  // 0 reserved as a flag. We pass the RAW key on the wire so the receiver
+  // can decide masking policy itself (lookup_memhandle tries both
+  // masked-and-raw to support legacy callers that don't set the flag).
   uint64_t src_key = reinterpret_cast<uint64_t>(srcMhandle);
   uint64_t dst_key = reinterpret_cast<uint64_t>(dstMhandle);
+  uint64_t sig_key = reinterpret_cast<uint64_t>(signalMhandle);
   // Only resolve src_mh when there's actually a payload to send. Signal
   // / flush ops legitimately call with srcMhandle=NULL → key=0, no need
   // to log a MISS.
@@ -742,8 +766,12 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
       (size > 0 && wire_op != kWireOpSignal && wire_op != kWireOpFlush);
   MemHandle* src_mh = has_payload ? cc->lookup_memhandle(src_key) : nullptr;
   if (has_payload && (src_mh == nullptr || src_mh->local_reg == 0)) {
+    // v6 (fault tolerance): a registration mismatch is a usage error
+    // — make it visible via QueryLastError so NCCL can fail-fast its
+    // proxy progress, instead of waiting forever on Test().
     LOG(ERROR) << "IputCommon: bad src_mh key=0x" << std::hex << src_key
                << " size=" << std::dec << size << " wire_op=" << wire_op;
+    SetGinError("IputCommon:bad-src-mh");
     return ncclInvalidArgument;
   }
 
@@ -752,17 +780,19 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   hdr.op = static_cast<uint16_t>(wire_op);
   hdr.source_rank = static_cast<uint32_t>(cc->rank());
   hdr.dest_rank = rank;
-  hdr.signal_handle = reinterpret_cast<uint64_t>(signalMhandle);
+  // v6 (S8): write masked keys on the wire so receiver lookup hits our
+  // ordinal map. (lookup_memhandle also masks for defence in depth.)
+  hdr.signal_handle = sig_key;
   hdr.dst_handle = dst_key;
   hdr.dst_off = dstOff;
   hdr.size = size;
   hdr.signal_val = signal_val;
   hdr.signal_off = signal_off;
-  (void)signal_op_arg;
 
   // Stage header in TX scratch for this peer.
+  // v6 (R4): kTlsTxSeqLen replaces the hard-coded 64.
   uint32_t slot_idx =
-      tls_tx_seq[rank % 64]++ & static_cast<uint32_t>(kTxSlotsPerPeer - 1);
+      tls_tx_seq[rank % kTlsTxSeqLen]++ & static_cast<uint32_t>(kTxSlotsPerPeer - 1);
   size_t hdr_off = sp->TxSlotOffset(static_cast<int>(rank), slot_idx);
 
   // Stage the WireHeader. Prefer the GDR-mapped host VA (no kernel
@@ -785,6 +815,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
     if (cerr != cudaSuccess) {
       LOG(ERROR) << "IputCommon: cudaMemcpy failed: "
                  << cudaGetErrorString(cerr);
+      SetGinError("IputCommon:cudaMemcpy");
       return ncclInternalError;
     }
   }
@@ -813,6 +844,10 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   }
   if (!hdr_or.ok()) {
     LOG(ERROR) << "IputCommon: header Send failed: " << hdr_or.status();
+    // v6 (fault tolerance): peer disconnect / DXS BadConnection — surface
+    // via QueryLastError. The caller drops the in-flight request; NCCL
+    // will fail-fast on its next progress tick.
+    SetGinError("IputCommon:hdr-Send");
     return ncclInternalError;
   }
   req->hdr_op = std::move(*hdr_or);
@@ -845,6 +880,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
     auto pay_or = sock->Send(srcOff, size, src_mh->local_reg);
     if (!pay_or.ok()) {
       LOG(ERROR) << "IputCommon: payload Send failed: " << pay_or.status();
+      SetGinError("IputCommon:pay-Send");
       return ncclInternalError;
     }
     req->pay_op = std::move(*pay_or);
@@ -861,17 +897,18 @@ ncclResult_t Iput(void* ginCtx, int context, uint64_t srcOff, void* srcMhandle,
                   uint32_t rank, void** request) {
   return IputCommon(ginCtx, context, srcOff, srcMhandle, size, dstOff,
                     dstMhandle, rank, request, kWireOpPut, 0,
-                    /*signalMhandle=*/nullptr, 0, 0);
+                    /*signalMhandle=*/nullptr, 0);
 }
 
 ncclResult_t IputSignal(void* ginCtx, int context, uint64_t srcOff,
                         void* srcMhandle, size_t size, uint64_t dstOff,
                         void* dstMhandle, uint32_t rank, uint64_t signalOff,
                         void* signalMhandle, uint64_t signalValue,
-                        uint32_t signalOp, void** request) {
+                        uint32_t /*signalOp*/, void** request) {
+  // v6 (R2): signalOp dropped — wire only carries ADD today.
   return IputCommon(ginCtx, context, srcOff, srcMhandle, size, dstOff,
                     dstMhandle, rank, request, kWireOpPutSignal, signalOff,
-                    signalMhandle, signalValue, signalOp);
+                    signalMhandle, signalValue);
 }
 
 ncclResult_t Iget(void* ginCtx, int context, uint64_t remoteOff,
@@ -880,13 +917,13 @@ ncclResult_t Iget(void* ginCtx, int context, uint64_t remoteOff,
   // Stub: emit a Get header; receiver-side Get reply not yet implemented.
   return IputCommon(ginCtx, context, /*srcOff=*/0, /*srcMhandle=*/localMhandle,
                     /*size=*/0, remoteOff, remoteMhandle, rank, request,
-                    kWireOpGet, 0, /*signalMhandle=*/nullptr, 0, 0);
+                    kWireOpGet, 0, /*signalMhandle=*/nullptr, 0);
 }
 
 ncclResult_t Iflush(void* ginCtx, int context, void* mhandle, uint32_t rank,
                     void** request) {
   return IputCommon(ginCtx, context, 0, mhandle, 0, 0, mhandle, rank, request,
-                    kWireOpFlush, 0, /*signalMhandle=*/nullptr, 0, 0);
+                    kWireOpFlush, 0, /*signalMhandle=*/nullptr, 0);
 }
 
 ncclResult_t Test(void* /*collComm*/, void* request, int* done) {
@@ -902,10 +939,16 @@ ncclResult_t Test(void* /*collComm*/, void* request, int* done) {
     return ncclSuccess;
   };
 
-  for (auto* op : {req->hdr_op.get(), req->pay_op.get(), req->sig_op.get()}) {
+  // v6 (R1): sig_op dropped from GinRequest.
+  for (auto* op : {req->hdr_op.get(), req->pay_op.get()}) {
     auto r = poll(op);
     if (!r.has_value()) return ncclSuccess;  // not done
-    if (*r != ncclSuccess) return *r;
+    if (*r != ncclSuccess) {
+      // v6 (fault tolerance): a SendOp returning a hard error means the
+      // peer connection is down; surface to NCCL.
+      SetGinError("Test:op-fail");
+      return *r;
+    }
   }
   *done = 1;
   delete req;

@@ -8,9 +8,11 @@
 
 #include "gin_provider/proxy_context.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -20,6 +22,11 @@
 #include "gin_provider/proxy_progress.h"
 
 namespace fastrak::gin {
+
+// v6 (S5): plugin-wide error flag. Storage lives here so both
+// plugin_main.cc and proxy_progress.cc can SetGinError() without
+// circular includes. Read by QueryLastError; cleared on Init().
+std::atomic<bool> g_has_error{false};
 
 // M6.2: env-overridable per-peer fan-out. Cached so we only parse once.
 int FanoutPerPeer() {
@@ -38,9 +45,32 @@ int FanoutPerPeer() {
 // ---- CollComm ----
 
 CollComm::~CollComm() {
-  // Destructors of held unique_ptrs handle teardown (DXS sockets close in
-  // their own destructors via SendMessage(CloseDataSockMessage)).
+  // v6 (S7 attempted, REVERTED): the original review flagged a UAF
+  // window between CloseColl and DestroyContext where the progress
+  // thread can still touch destroyed peers_/sockets/memhandles_. We
+  // tried to fix it by tracking attached GinCtx and synchronously
+  // joining their progress threads here — but inbound/outbound
+  // WaitRecvDone has a 60s deadline that doesn't observe stop_, so
+  // ~CollComm started blocking CloseColl for up to 60s and broke
+  // multi-config NCCL flows (DeepEP test_pp crashed with CUDA
+  // launch failure after the first config when CloseColl took too
+  // long). Proper fix needs either (a) a way to abort an in-flight
+  // dxs::RecvLinearized at teardown time or (b) separating "signal
+  // stop" from "join" so ~CollComm only signals. For now we keep the
+  // v5 best-effort behaviour: progress threads see destroyed memory
+  // briefly and may log/crash, but CloseColl returns promptly.
+  // ctxs_ list is kept for future use (currently unread).
   peers_.clear();
+}
+
+void CollComm::register_ctx(GinCtx* ctx) {
+  absl::MutexLock l(&ctx_mu_);
+  ctxs_.push_back(ctx);
+}
+
+void CollComm::unregister_ctx(GinCtx* ctx) {
+  absl::MutexLock l(&ctx_mu_);
+  ctxs_.erase(std::remove(ctxs_.begin(), ctxs_.end(), ctx), ctxs_.end());
 }
 
 absl::Status CollComm::Init(
@@ -173,7 +203,11 @@ uint8_t* CollComm::signal_host_addr(uint64_t signal_handle,
 
 // ---- GinCtx ----
 
-GinCtx::~GinCtx() { StopProgress(); }
+GinCtx::~GinCtx() {
+  StopProgress();
+  // v6 (S7 attempted, REVERTED): no unregister_ctx call since Init no
+  // longer registers. See CollComm::~CollComm comment.
+}
 
 absl::Status GinCtx::Init(uint32_t queue_size, int n_counters, int n_signals) {
   if (coll_ == nullptr) {
@@ -184,6 +218,10 @@ absl::Status GinCtx::Init(uint32_t queue_size, int n_counters, int n_signals) {
                                     n_signals));
   ASSIGN_OR_RETURN(scratch_,
                    AllocateScratchPool(coll_->nranks(), coll_->buffer_mgr()));
+  // v6 (S7 attempted, REVERTED): coll_->register_ctx(this) removed —
+  // see CollComm::~CollComm comment for why the synchronous-join fix
+  // had to be backed out. The function is kept declared for the future
+  // attempt that needs an abortable WaitRecvDone.
   return absl::OkStatus();
 }
 
