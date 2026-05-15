@@ -1061,7 +1061,16 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   // v9: validate the per_nic reg for the lane's NIC, not just slot 0.
   dxs::Reg src_reg_for_lane =
       (src_mh != nullptr) ? src_mh->per_nic_regs[lane_nic_idx] : 0;
-  if (has_payload && (src_mh == nullptr || src_reg_for_lane == 0)) {
+
+  // v13b inline source path: NCCL_PTR_HOST + size <= 16 means caller is
+  // gin.put_value() and the actual bytes live at src_mh->base+srcOff in
+  // unregistered host memory. We pack them into the WireHeader and let
+  // the receiver materialize them, skipping payload Send entirely.
+  bool inline_src = (has_payload && src_mh != nullptr &&
+                     (src_mh->ptr_type & NCCL_PTR_HOST) &&
+                     size <= kWireInlineMaxBytes);
+
+  if (has_payload && !inline_src && (src_mh == nullptr || src_reg_for_lane == 0)) {
     // v6 (fault tolerance): a registration mismatch is a usage error
     // — make it visible via QueryLastError so NCCL can fail-fast its
     // proxy progress, instead of waiting forever on Test().
@@ -1094,6 +1103,13 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   // mode (one proxy thread per process), so fetch_add is uncontended.
   hdr.wire_seq =
       peer->wire_seq_next.fetch_add(1, std::memory_order_relaxed);
+  if (inline_src) {
+    hdr.flags |= kWireFlagInlineSrc;
+    std::memset(hdr.inline_data, 0, sizeof(hdr.inline_data));
+    const uint8_t* hp =
+        static_cast<const uint8_t*>(src_mh->base) + srcOff;
+    std::memcpy(hdr.inline_data, hp, size);
+  }
 
   // Stage header in TX scratch for this peer.
   uint32_t slot_idx =
@@ -1180,7 +1196,7 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   // medians: rank0 44.3->54.0 GB/s (+22%), rank1 49.3->53.3 GB/s (+8%)
   // vs v3 (commit b4aec08, fanout=4 with the inline wait).
 
-  if (has_payload) {
+  if (has_payload && !inline_src) {
     if (src_mh == nullptr || src_reg_for_lane == 0) {
       LOG(ERROR) << "IputCommon: src_mh missing for size=" << size
                  << " lane_nic=" << lane_nic_idx;

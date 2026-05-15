@@ -241,6 +241,7 @@ class CollComm {
   PeerConn* peer(int peer_rank);
   size_t num_peers() const { return peers_.size(); }
   int rank() const { return rank_; }
+  int dev() const { return dev_; }
   int nranks() const { return nranks_; }
   uint8_t fastrak_idx() const { return fastrak_idx_; }
   const std::string& nic_ip() const { return nic_ip_; }

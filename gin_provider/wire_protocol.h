@@ -61,6 +61,8 @@ enum WireOp : uint16_t {
 };
 
 constexpr uint16_t kWireFlagHasCounter = 1u << 0;
+constexpr uint16_t kWireFlagInlineSrc  = 1u << 1;
+constexpr size_t   kWireInlineMaxBytes = 16;
 
 struct WireHeader {
   uint32_t magic;          // = kWireMagic
@@ -95,7 +97,8 @@ struct WireHeader {
   // lane already FIFO). 1-based; 0 means "no seq, skip ordering" so legacy
   // TickOutbound senders that don't fill it stay correct.
   uint64_t wire_seq;
-  uint8_t  pad[56];        // pad WireHeader out to 128 bytes
+  uint8_t  inline_data[kWireInlineMaxBytes];
+  uint8_t  pad[40];        // pad WireHeader out to 128 bytes
 };
 static_assert(sizeof(WireHeader) == 128,
               "WireHeader must be exactly 128 bytes");

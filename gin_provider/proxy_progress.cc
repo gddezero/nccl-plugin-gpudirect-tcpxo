@@ -248,6 +248,13 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
   auto* gpu = ctx_ ? ctx_->gpu_ctx() : nullptr;
   auto* scratch = ctx_ ? ctx_->scratch() : nullptr;
   if (cc == nullptr || gpu == nullptr || scratch == nullptr) return;
+  // v13b: this thread is started by std::thread without inheriting the CUDA
+  // device context; cudaMemcpy on inline-source paths and the existing
+  // device->host header memcpy both require that current device == cc->dev().
+  if (cc->dev() >= 0) {
+    cudaSetDevice(cc->dev());
+    cudaGetLastError();
+  }
   auto* recv_sock = cc->inbound(inbound_idx);
   if (recv_sock == nullptr) return;
   // v9: this inbound thread's recv socket was accepted on a specific local
@@ -396,6 +403,34 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                        << " for size=" << hdr.size << " op=" << hdr.op
                        << " nic=" << inbound_nic;
             SetGinError("RunInbound:bad-dst-handle");
+            break;
+          }
+
+          if ((hdr.flags & kWireFlagInlineSrc) && hdr.size > 0) {
+            void* dst_dev =
+                static_cast<uint8_t*>(dst->base) + hdr.dst_off;
+            cudaError_t cerr =
+                cudaMemcpy(dst_dev, hdr.inline_data, hdr.size,
+                           cudaMemcpyHostToDevice);
+            if (cerr != cudaSuccess) {
+              LOG(ERROR) << "RunInbound: inline cudaMemcpy failed: "
+                         << cudaGetErrorString(cerr) << " size=" << hdr.size
+                         << " dev=" << cc->dev();
+              SetGinError("RunInbound:inline-cudaMemcpy");
+              break;
+            }
+            wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+            if (hdr.op == kWireOpPutSignal && hdr.signal_handle != 0) {
+              uint8_t* slot_b =
+                  cc->signal_host_addr(hdr.signal_handle, hdr.signal_off);
+              if (slot_b != nullptr) {
+                auto* slot_u64 = reinterpret_cast<volatile uint64_t*>(slot_b);
+                absl::MutexLock l(cc->signal_mu());
+                *slot_u64 += hdr.signal_val;
+                __asm__ __volatile__("sfence" ::: "memory");
+              }
+            }
+            bump_commit_seq(hdr.source_rank, hdr.wire_seq);
             break;
           }
           auto p_or = recv_sock->RecvLinearized(hdr.dst_off, hdr.size,
