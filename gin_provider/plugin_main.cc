@@ -262,9 +262,22 @@ ncclResult_t Listen(void* /*ctx*/, int dev, void* handle,
   h.primary_nic_idx = static_cast<uint8_t>(primary_pos < 0 ? 0 : primary_pos);
   EncodeListenHandle(handle, h);
 
-  LOG(INFO) << absl::StrFormat(
-      "GIN Listen v9: dev=%d primary_nic=%u n_listens=%d total_nics=%u",
-      dev, primary_idx, n_listens, (unsigned)h.n_nics);
+  {
+    std::string nic_summary;
+    for (int i = 0; i < h.n_nics; ++i) {
+      char buf[64];
+      in_addr in;
+      std::memcpy(&in.s_addr, h.nics[i].addr, 4);
+      char astr[INET_ADDRSTRLEN] = {0};
+      inet_ntop(AF_INET, &in, astr, sizeof(astr));
+      snprintf(buf, sizeof(buf), "[%d:%s:%u/idx%u]", i, astr,
+               (unsigned)h.nics[i].port, (unsigned)h.nics[i].fastrak_idx);
+      nic_summary += buf;
+    }
+    LOG(WARNING) << absl::StrFormat(
+        "GIN Listen v9: dev=%d primary_nic=%u n_listens=%d total_nics=%u pid=%d nics=%s",
+        dev, primary_idx, n_listens, (unsigned)h.n_nics, getpid(), nic_summary);
+  }
 
   *listenComm = lc.release();
   return ncclSuccess;
@@ -315,6 +328,13 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
     LOG(ERROR) << "GIN Connect: no local NIC provisioned";
     return ncclInternalError;
   }
+
+  std::set<std::string> local_node_ip_set;
+  for (int i = 0; i < static_cast<int>(fastrak::kNcclNetIfs); ++i) {
+    const auto& d_i = fastrak::kNcclSocketDevs[i];
+    if (d_i.pci_path == nullptr) continue;
+    local_node_ip_set.insert(d_i.ip_addr);
+  }
   // Primary == listen NIC NCCL chose.
   dxs::DxsClientInterface* primary_dxs = per_nic_dxs[lc->primary_fastrak_idx];
   tcpdirect::BufferManagerClientInterface* primary_buf =
@@ -347,6 +367,8 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
     local_nic_for_lane[lane] = local_nic_indices[lane % n_local_nics];
   }
 
+  std::vector<bool> same_node_peer(nranks, false);
+
   for (int r = 0; r < nranks; ++r) {
     if (r == rank) continue;
     if (handles[r] == nullptr) {
@@ -354,6 +376,22 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
       return ncclInvalidArgument;
     }
     ListenHandle h = DecodeListenHandle(handles[r]);
+    if (rank == 0 && r < 4) {
+      std::string ns;
+      for (int i = 0; i < h.n_nics; ++i) {
+        char buf[64];
+        in_addr in;
+        std::memcpy(&in.s_addr, h.nics[i].addr, 4);
+        char astr[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &in, astr, sizeof(astr));
+        snprintf(buf, sizeof(buf), "[%d:%s:%u/idx%u]", i, astr,
+                 (unsigned)h.nics[i].port, (unsigned)h.nics[i].fastrak_idx);
+        ns += buf;
+      }
+      LOG(WARNING) << "GIN Connect: peer rank=" << r << " handle pid=" << getpid()
+                   << " magic=" << absl::Hex(h.magic) << " ver=" << h.version
+                   << " n_nics=" << (unsigned)h.n_nics << " nics=" << ns;
+    }
     if (h.magic != kListenHandleMagic || h.version != kListenHandleVersion ||
         h.n_nics == 0 || h.n_nics > kListenHandleMaxNics) {
       LOG(ERROR) << absl::StrFormat(
@@ -376,6 +414,11 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
       peer_addr_by_lane[r][lane] = addr_str;
       peer_port_by_lane[r][lane] = peer_slot.port;
     }
+    if (local_node_ip_set.count(peer_addr_by_lane[r][0]) > 0) {
+      same_node_peer[r] = true;
+      LOG(INFO) << "GIN Connect: skip same-node peer rank=" << r
+                << " peer_addr=" << peer_addr_by_lane[r][0];
+    }
   }
 
   // Issue all outbound Connects up front (per peer per lane). Each lane
@@ -386,13 +429,62 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
       nranks);
   std::vector<std::vector<int>> ready_local_nic(nranks);
   std::vector<int> ready_count(nranks, 0);
+  // v12.2: Per-peer rail alignment. For each (peer, lane) the local NIC
+  // we source the Connect from MUST equal the peer NIC index (TCPXO
+  // is railed: NIC i talks only to NIC i). Lazy-bring-up DxsClient for
+  // any local NIC we did not Listen on.
+  std::vector<std::vector<int>> per_peer_local_nic(
+      nranks, std::vector<int>(fanout, 0));
   for (int r = 0; r < nranks; ++r) {
     if (r == rank) continue;
+    if (same_node_peer[r]) {
+      ready_count[r] = fanout;
+      continue;
+    }
     pending[r].resize(fanout);
     ready[r].reserve(fanout);
     ready_local_nic[r].reserve(fanout);
     for (int lane = 0; lane < fanout; ++lane) {
-      const int local_nic = local_nic_for_lane[lane];
+      const int target_nic = peer_nic_idx_by_lane[r][lane];
+      if (target_nic < 0 || target_nic >= kMaxNics) {
+        LOG(ERROR) << "GIN Connect: bad peer_nic_idx peer_rank=" << r
+                   << " lane=" << lane << " target_nic=" << target_nic;
+        return ncclInvalidArgument;
+      }
+      // Bring up local DxsClient for target_nic if not already.
+      if (per_nic_dxs[target_nic] == nullptr) {
+        if (target_nic >= static_cast<int>(fastrak::kNcclNetIfs)) {
+          LOG(ERROR) << "GIN Connect: target_nic " << target_nic
+                     << " >= kNcclNetIfs " << fastrak::kNcclNetIfs;
+          return ncclInternalError;
+        }
+        const auto& d_t = fastrak::kNcclSocketDevs[target_nic];
+        if (d_t.pci_path == nullptr) {
+          LOG(ERROR) << "GIN Connect: local NIC slot " << target_nic
+                     << " is not fastrak (no pci_path); peer_rank=" << r;
+          return ncclInternalError;
+        }
+        auto dxs_or = fastrak::GetNicClientRouter().GetDxsClient(d_t.ip_addr);
+        if (!dxs_or.ok()) {
+          LOG(ERROR) << "GIN Connect: lazy GetDxsClient(" << d_t.ip_addr
+                     << ") for peer_rank=" << r << " lane=" << lane
+                     << " failed: " << dxs_or.status();
+          return StatusToNccl(dxs_or.status());
+        }
+        auto buf_or = fastrak::GetNicClientRouter().GetBufferManagerClient(
+            d_t.ip_addr);
+        if (!buf_or.ok()) {
+          LOG(ERROR) << "GIN Connect: lazy GetBufferManagerClient("
+                     << d_t.ip_addr << ") for peer_rank=" << r
+                     << " lane=" << lane << " failed: " << buf_or.status();
+          return StatusToNccl(buf_or.status());
+        }
+        per_nic_dxs[target_nic] = *dxs_or;
+        per_nic_bufmgr[target_nic] = *buf_or;
+        nic_ips_by_idx[target_nic] = d_t.ip_addr;
+      }
+      const int local_nic = target_nic;
+      per_peer_local_nic[r][lane] = local_nic;
       auto* lane_dxs = per_nic_dxs[local_nic];
       auto sock_or =
           lane_dxs->Connect(peer_addr_by_lane[r][lane].c_str(),
@@ -410,11 +502,21 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
   }
 
   // Per-NIC inbound target counts: for each local NIC i, expect
-  // (nranks-1) * (count of lanes whose local_nic==i) accepts.
+  // (#cross-node peers) * (count of lanes whose local_nic==i) accepts.
+  // Same-node peers do not GIN-connect, so they do not GIN-accept either.
+  // v12.2: inbound target per local NIC reflects per-peer local NIC
+  // assignment. Each cross-node peer accepts inbound on this rank's NIC
+  // that matches the peer's primary NIC index (rail aligned).
   std::array<size_t, kMaxNics> inbound_target_per_nic = {};
-  for (int lane = 0; lane < fanout; ++lane) {
-    int li = local_nic_for_lane[lane];
-    inbound_target_per_nic[li] += static_cast<size_t>(nranks - 1);
+  for (int r = 0; r < nranks; ++r) {
+    if (r == rank) continue;
+    if (same_node_peer[r]) continue;
+    for (int lane = 0; lane < fanout; ++lane) {
+      // Peers Connect FROM their local NIC == our primary NIC index.
+      // Our primary NIC is lc->primary_fastrak_idx — every cross-node peer
+      // will land an Accept on that NIC's listen sock.
+      inbound_target_per_nic[lc->primary_fastrak_idx] += 1;
+    }
   }
   std::array<size_t, kMaxNics> accepted_per_nic = {};
   size_t total_inbound_target = 0;
@@ -428,6 +530,7 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
     // Drain pending outbound.
     for (int r = 0; r < nranks; ++r) {
       if (r == rank) continue;
+      if (same_node_peer[r]) continue;
       bool peer_all_done = true;
       for (int lane = 0; lane < fanout; ++lane) {
         if (pending[r][lane] == nullptr) continue;
@@ -437,12 +540,16 @@ ncclResult_t Connect(void* /*ctx*/, void* handles[], int nranks, int rank,
           continue;
         }
         if (!status->ok()) {
-          LOG(ERROR) << "GIN Connect outbound to rank " << r << " lane "
-                     << lane << " failed: " << *status;
+          LOG(ERROR) << "GIN Connect outbound: rank=" << r << " lane=" << lane
+                     << " peer=" << peer_addr_by_lane[r][lane] << ":"
+                     << peer_port_by_lane[r][lane]
+                     << " local_nic=" << local_nic_for_lane[lane]
+                     << " local_pid=" << getpid()
+                     << " failed: " << *status;
           return StatusToNccl(*status);
         }
         ready[r].push_back(std::move(pending[r][lane]));
-        ready_local_nic[r].push_back(local_nic_for_lane[lane]);
+        ready_local_nic[r].push_back(per_peer_local_nic[r][lane]);
         pending[r][lane] = nullptr;
         ++ready_count[r];
       }
