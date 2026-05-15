@@ -972,7 +972,12 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
         uint64_t prev = *slot_u64;
         uint64_t next = prev + signal_val;
         *slot_u64 = next;
-        __asm__ __volatile__("sfence" ::: "memory");
+        // v24: was sfence — too weak for WC mappings (does not drain WC
+        // store buffer). Match inbound path's clflushopt+mfence so the
+        // GPU/PCIe always sees this self-signal write before the next
+        // consumer read. Fixes HT EP=16 1e-9 precision miss caused by
+        // GPU reading stale snapshot when self-signal was last writer.
+        __asm__ __volatile__("clflushopt (%0); mfence" :: "r"(reinterpret_cast<volatile void*>(slot_u64)) : "memory");
         // v5: TLS — see dbg_count_tls.
         thread_local int ss_dbg_tls = 0;
         if (ss_dbg_tls < 4) {
