@@ -450,8 +450,23 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
       auto* atom = cc->recv_commit_seq(static_cast<int>(src));
       if (atom == nullptr) return;
       uint32_t spins = 0;
+      // v25: wedge detector — log once per stuck wait so we can see if
+      // dispatch-2 deadlock is rooted in a missed bump_commit_seq from a
+      // prior op (sender's wire_seq is monotonic across dispatch calls;
+      // any skipped bump permanently wedges all later ops on this src).
+      auto t0 = std::chrono::steady_clock::now();
+      bool warned = false;
       while (atom->load(std::memory_order_acquire) != seq) {
         if ((++spins & 4095) == 0) std::this_thread::yield();
+        if (!warned) {
+          auto dt = std::chrono::steady_clock::now() - t0;
+          if (dt > std::chrono::seconds(5)) {
+            LOG(WARNING) << "v25 wait_for_commit_turn WEDGED src=" << src
+                         << " expected_seq=" << seq
+                         << " atom=" << atom->load(std::memory_order_acquire);
+            warned = true;
+          }
+        }
       }
     };
     auto bump_commit_seq = [cc](uint32_t src, uint64_t seq) {
@@ -485,6 +500,10 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                        << " for size=" << hdr.size << " op=" << hdr.op
                        << " nic=" << inbound_nic;
             SetGinError("RunInbound:bad-dst-handle");
+            // v25: drop op cleanly — gate then bump so later wire_seqs
+            // from this src don't wedge in wait_for_commit_turn forever.
+            wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+            bump_commit_seq(hdr.source_rank, hdr.wire_seq);
             break;
           }
 
@@ -499,6 +518,9 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
                          << cudaGetErrorString(cerr) << " size=" << hdr.size
                          << " dev=" << cc->dev();
               SetGinError("RunInbound:inline-cudaMemcpy");
+              // v25: drop op cleanly (see comment above).
+              wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+              bump_commit_seq(hdr.source_rank, hdr.wire_seq);
               break;
             }
             wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
@@ -522,6 +544,9 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
             LOG(ERROR) << "RunInbound: payload RecvLinearized failed: "
                        << p_or.status();
             SetGinError("RunInbound:payload-RecvLinearized");
+            // v25: drop op cleanly (see comment above).
+            wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+            bump_commit_seq(hdr.source_rank, hdr.wire_seq);
             break;
           }
           auto p = std::move(*p_or);
@@ -529,6 +554,9 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
           if (!p_sz.ok()) {
             LOG(ERROR) << "RunInbound: payload recv wait: " << p_sz.status();
             SetGinError("RunInbound:payload-wait");
+            // v25: drop op cleanly (see comment above).
+            wait_for_commit_turn(hdr.source_rank, hdr.wire_seq);
+            bump_commit_seq(hdr.source_rank, hdr.wire_seq);
             break;
           }
           // v5 (M6.6): TLS dbg counter — see rx_dbg_tls comment.
