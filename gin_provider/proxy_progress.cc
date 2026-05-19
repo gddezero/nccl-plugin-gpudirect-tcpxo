@@ -130,6 +130,27 @@ void ProxyProgress::TickOutbound() {
   auto* scratch = ctx_ ? ctx_->scratch() : nullptr;
   if (gpu == nullptr || cc == nullptr || scratch == nullptr) return;
 
+  // PR3c-iii (β port, 2026-05-16): emit async ACK to each peer per
+  // progress tick. CollComm::EmitAck is best-effort + idempotent (skips
+  // when no new info to ACK, when peer not connected, when in-flight
+  // ACK quota reached). This out-of-band ACK channel breaks the PR3c-ii
+  // Test() gate circular deadlock — runs even when wrapper credit is
+  // stuck because GinProgress (which calls TickOutbound) is invoked by
+  // NCCL's polling regardless of in-flight request count.
+  int nranks_total = (cc->nranks() > 0) ? cc->nranks() : gpu->nranks;
+  for (int p = 0; p < nranks_total; ++p) {
+    if (p == cc->rank()) continue;
+    auto s = cc->EmitAck(p, scratch);
+    if (!s.ok()) {
+      // Best-effort; log once per peer-error pair (TLS counter to avoid spam).
+      thread_local int ack_err_tls = 0;
+      if (ack_err_tls < 4) {
+        ++ack_err_tls;
+        LOG(WARNING) << "TickOutbound: EmitAck(" << p << ") failed: " << s;
+      }
+    }
+  }
+
   for (int p = 0; p < gpu->nranks; ++p) {
     if (p == cc->rank()) continue;
     auto* peer = cc->peer(p);
@@ -416,6 +437,23 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
       LOG(ERROR) << "RunInbound: bad magic 0x" << std::hex << hdr.magic;
       SetGinError("RunInbound:bad-magic");
       continue;
+    }
+    // PR3c-ii (β port, 2026-05-16): every inbound hdr piggybacks the
+    // sender's view of "what I (the sender) have processed of YOUR ops"
+    // in hdr.piggy_ack_high_water (sender wrote it in IputCommon or via
+    // EmitAck). atomic_max into peer_acked_high_water[source_rank] gives
+    // Test() the ack signal it needs to gate done=1. Skip if 0 sentinel.
+    if (hdr.piggy_ack_high_water != 0) {
+      if (auto* atom = cc->peer_acked_high_water(
+              static_cast<int>(hdr.source_rank))) {
+        uint64_t cur = atom->load(std::memory_order_relaxed);
+        while (hdr.piggy_ack_high_water > cur &&
+               !atom->compare_exchange_weak(cur, hdr.piggy_ack_high_water,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+          // cur was updated by another thread; loop and retry.
+        }
+      }
     }
     // v5 (M6.6): TLS dbg counter (was static std::atomic<int> rx_dbg).
     // The atomic fetch_add cost a cross-thread cache-line bounce on every
@@ -790,6 +828,12 @@ void ProxyProgress::RunInbound(size_t inbound_idx) {
         bump_commit_seq(hdr.source_rank, hdr.wire_seq);
         break;
       }
+      case kWireOpAck:
+        // PR3c-iii (β port, 2026-05-16): standalone async ACK from peer.
+        // hdr.piggy_ack_high_water was already consumed before the switch
+        // (atomic_max into peer_acked_high_water). No payload, no signal
+        // RMW, no commit_seq bump (sender stamped wire_seq=0). Done.
+        break;
       case kWireOpFlush:
         // Marker only — flush is initiated by source's progress thread.
         // Still bump seq so subsequent ops aren't stuck.

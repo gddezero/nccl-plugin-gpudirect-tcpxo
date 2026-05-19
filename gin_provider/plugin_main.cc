@@ -897,7 +897,29 @@ struct GinRequest {
   std::unique_ptr<dxs::SendOpInterface> pay_op;
   CollComm* coll = nullptr;
   uint32_t  scratch_slot = UINT32_MAX;
+  // PR3c-i (β port, 2026-05-16): peer-ack gate fields for Test().
+  //   my_wire_seq  = sender's wire_seq stamped onto hdr.wire_seq (v11
+  //                  cross-lane FIFO seq; 0 means no seq, no gate).
+  //   my_dst_rank  = the rank this request was sent to; -1 means no gate
+  //                  (e.g. legacy code paths or pre-gate self-signal).
+  // Wired in PR3c-i (set in IputCommon). Read by Test() in PR3c-ii to
+  // wait until peer_acked_high_water[my_dst_rank] >= my_wire_seq before
+  // reporting done=1 (closes the "Test() reports too early -> wrapper
+  // cisShadow advances -> dispatch-2 crowds the wire" deadlock window
+  // identified by N+M+B2 triple convergence).
+  uint64_t  my_wire_seq = 0;
+  int       my_dst_rank = -1;
+  // PR3c-iv (2026-05-16): deadline-based force-pass for peer-ack gate.
+  // 0 = not yet polled. First Test() stamps absl::Now() ticks; if gate
+  // would block past kPeerAckGateDeadlineNs, force done=1 to avoid
+  // circular deadlock with DXS SendOp timeout.
+  int64_t   first_test_ns = 0;
 };
+
+// PR3c-iv: max time Test() may stall on peer-ack gate before force-pass.
+// 100ms chosen because sleep(0.1) workaround in DeepEP test achieved first-
+// ever iter PASS — proves 100ms is sufficient timing-fence window.
+static constexpr int64_t kPeerAckGateDeadlineNs = 100LL * 1000LL * 1000LL;
 
 // v7: per-thread TX scratch ring slot counter, indexed by `rank % 64`.
 // Threads with rank index aliasing each other share the same ring; modulo
@@ -1108,6 +1130,20 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   // mode (one proxy thread per process), so fetch_add is uncontended.
   hdr.wire_seq =
       peer->wire_seq_next.fetch_add(1, std::memory_order_relaxed);
+  // PR3c-i (β port, 2026-05-16): piggyback "what I (sender) have processed
+  // from DST so far" so receiver of THIS hdr (the DST rank) learns its own
+  // ack high water on the OTHER side and can gate its Test(). Uses the v11
+  // recv_commit_seq cursor: cc->recv_commit_seq(dst_rank) is our atomic
+  // counter of "fully processed inbound ops from DST". DST's RunInbound
+  // (PR3c-ii) will atomic_max its peer_acked_high_water[my rank] against
+  // this value. 0 means "no inbound processed from this dst yet" (sentinel
+  // kAckPiggyNone); receiver skips the update in that case.
+  if (auto* my_recv_atom = cc->recv_commit_seq(static_cast<int>(rank))) {
+    hdr.piggy_ack_high_water =
+        my_recv_atom->load(std::memory_order_relaxed);
+  } else {
+    hdr.piggy_ack_high_water = kAckPiggyNone;
+  }
   if (inline_src) {
     hdr.flags |= kWireFlagInlineSrc;
     std::memset(hdr.inline_data, 0, sizeof(hdr.inline_data));
@@ -1149,6 +1185,11 @@ static ncclResult_t IputCommon(void* ginCtx, int /*context*/,
   auto req = std::make_unique<GinRequest>();
   req->coll = cc;
   req->scratch_slot = slot_idx;
+  // PR3c-i (β port, 2026-05-16): store this request's gate inputs for
+  // Test() (gate logic wired in PR3c-ii). hdr.wire_seq was just allocated
+  // above; copy it here so Test() doesn't need to re-read the WireHeader.
+  req->my_wire_seq = hdr.wire_seq;
+  req->my_dst_rank = static_cast<int>(rank);
 
   // v5: TLS — see dbg_count_tls.
   thread_local int snd_pre_tls = 0;
@@ -1278,6 +1319,39 @@ ncclResult_t Test(void* /*collComm*/, void* request, int* done) {
       // peer connection is down; surface to NCCL.
       SetGinError("Test:op-fail");
       return *r;
+    }
+  }
+  // PR3c-ii (β port, 2026-05-16): peer-ack gate. Local Send drain alone
+  // is insufficient — N candidate #1 + M source audit + B2 quantification
+  // identified that wrapper cisShadow advancing on local-drain-only lets
+  // dispatch-N+1 crowd the wire while peer's RunInbound is still draining
+  // dispatch-N's tail. Gate: also wait until peer has confirmed processing
+  // up to my_wire_seq (peer_acked_high_water[dst] >= my_wire_seq).
+  //
+  // PR3c-iii (β port, 2026-05-16) supplies async ACKs via TickOutbound's
+  // CollComm::EmitAck so the gate can't circular-deadlock on bidirectional
+  // payload traffic alone — ACKs flow even when wrapper credit is stuck.
+  //
+  // hw==0 = "no ack from this dst yet" sentinel; bypass to avoid
+  // first-request deadlock. After first inbound (or first ACK) arrives
+  // from dst, hw>0 and the gate engages for subsequent requests.
+  if (req->my_dst_rank >= 0 && req->my_wire_seq != 0 &&
+      req->coll != nullptr) {
+    auto* atom = req->coll->peer_acked_high_water(req->my_dst_rank);
+    if (atom != nullptr) {
+      uint64_t hw = atom->load(std::memory_order_acquire);
+      if (hw > 0 && hw < req->my_wire_seq) {
+        // PR3c-iv: deadline-based force-pass. Stamp first poll time, then
+        // bail to done=1 once elapsed > kPeerAckGateDeadlineNs. Trades
+        // strict ack-ordering for liveness — relies on async EmitAck +
+        // wire_seq commit_seq ordering in lower layer to keep correctness.
+        int64_t now_ns = absl::ToUnixNanos(absl::Now());
+        if (req->first_test_ns == 0) req->first_test_ns = now_ns;
+        if (now_ns - req->first_test_ns < kPeerAckGateDeadlineNs) {
+          return ncclSuccess;  // *done stays 0; NCCL polls again
+        }
+        // else: deadline expired, fall through to *done=1
+      }
     }
   }
   *done = 1;

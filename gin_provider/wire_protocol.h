@@ -58,11 +58,25 @@ enum WireOp : uint16_t {
   kWireOpGet = 4,          // request peer to send back (size, reg, off)
   kWireOpGetReply = 5,     // peer's reply to a Get
   kWireOpFlush = 6,
+  // PR1 (β port, 2026-05-16): standalone ACK op. PR3 wires the sender/
+  // receiver handlers (clear_ack_range + stash_pending_ack + flush_stale_acks).
+  kWireOpAck = 7,          // standalone range-ACK (no payload)
 };
 
 constexpr uint16_t kWireFlagHasCounter = 1u << 0;
 constexpr uint16_t kWireFlagInlineSrc  = 1u << 1;
 constexpr size_t   kWireInlineMaxBytes = 16;
+
+// PR1 (β port, 2026-05-16): flag bits for the AWS-style ACK protocol layer.
+// These live in WireHeader::flags_ack, distinct from the legacy
+// WireHeader::flags bitmask above which gates inline-src / counter behavior.
+constexpr uint8_t kAckFlagAckReq = 1u << 0;   // sender requests ACK for this op
+
+// PR3c-i (β port, 2026-05-16): "no piggyback ack" sentinel for
+// WireHeader::piggy_ack_high_water. Senders that have no recv state yet
+// (very first outbound op before any inbound from peer) write 0; receivers
+// skip atomic_max if hdr.piggy_ack_high_water == 0.
+constexpr uint64_t kAckPiggyNone = 0;
 
 struct WireHeader {
   uint32_t magic;          // = kWireMagic
@@ -98,7 +112,25 @@ struct WireHeader {
   // TickOutbound senders that don't fill it stay correct.
   uint64_t wire_seq;
   uint8_t  inline_data[kWireInlineMaxBytes];
-  uint8_t  pad[40];        // pad WireHeader out to 128 bytes
+  // PR1 (β port, 2026-05-16): AWS-style ACK protocol fields. Declared in
+  // PR1; producer/consumer wired in PR3. Distinct layer from wire_seq above:
+  //   - wire_seq            = v11 cross-lane FIFO ordering (per-source,
+  //                           plugin-private, never resets).
+  //   - seq_num / ack_*     = AWS modular seq for in-flight bitmap + range
+  //                           ACK to gate Test() done=1 on peer-side commit.
+  // Two layers compose: wire_seq guards lane reorder, AWS seq guards "peer
+  // really consumed it" (the dispatch-2 deadlock root cause per N candidate
+  // #1 + M source audit + B2 quantification).
+  uint16_t seq_num;            // AWS bitmap seq (mod RING_SIZE) — PR3 unused
+  uint8_t  seg_cnt;            // segment count for this op (>=1) — PR3 unused
+  uint8_t  flags_ack;          // bitmask of kAckFlag* (e.g. kAckFlagAckReq)
+  uint8_t  _ack_rsvd0[4];      // alignment so piggy_ack_high_water 8-aligned
+  // PR3c-i (β port, 2026-05-16): piggyback receiver's recv_commit_seq for
+  // this op's destination. Receiver of THIS hdr reads it as "src has
+  // processed up to seq N from me" and updates peer_acked_high_water[src].
+  // 0 = sender had no state to piggyback (sentinel kAckPiggyNone).
+  uint64_t piggy_ack_high_water;
+  uint8_t  pad[24];            // pad WireHeader out to 128 bytes
 };
 static_assert(sizeof(WireHeader) == 128,
               "WireHeader must be exactly 128 bytes");

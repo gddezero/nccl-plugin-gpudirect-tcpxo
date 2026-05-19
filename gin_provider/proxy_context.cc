@@ -20,6 +20,8 @@
 #include "dxs/client/oss/status_macros.h"
 #include "gin_provider/gpu_ctx_alloc.h"
 #include "gin_provider/proxy_progress.h"
+#include "gin_provider/scratch_pool.h"
+#include "gin_provider/wire_protocol.h"
 
 namespace fastrak::gin {
 
@@ -121,6 +123,14 @@ absl::Status CollComm::Init(
       std::make_unique<std::atomic<uint64_t>[]>(recv_commit_seq_n_);
   for (size_t i = 0; i < recv_commit_seq_n_; ++i) {
     recv_commit_seq_[i].store(1, std::memory_order_relaxed);
+  }
+  // PR3c-ii (β port, 2026-05-16): per-dst peer ack high water. Init 0
+  // = sentinel "no ack from this dst yet"; Test() bypasses gate then.
+  peer_acked_high_water_n_ = static_cast<size_t>(nranks);
+  peer_acked_high_water_ =
+      std::make_unique<std::atomic<uint64_t>[]>(peer_acked_high_water_n_);
+  for (size_t i = 0; i < peer_acked_high_water_n_; ++i) {
+    peer_acked_high_water_[i].store(0, std::memory_order_relaxed);
   }
   LOG(INFO) << "CollComm::Init dev=" << dev << " fastrak_idx=" << (int)fastrak_idx
             << " nic_ip=" << nic_ip_ << " rank=" << rank << "/" << nranks
@@ -293,6 +303,111 @@ absl::Status GinCtx::Init(uint32_t queue_size, int n_counters, int n_signals) {
   // see CollComm::~CollComm comment for why the synchronous-join fix
   // had to be backed out. The function is kept declared for the future
   // attempt that needs an abortable WaitRecvDone.
+  return absl::OkStatus();
+}
+
+// PR3c-iii (β port, 2026-05-16): emit a standalone kWireOpAck to peer.
+// Best-effort, idempotent. Called by ProxyProgress::TickOutbound on every
+// progress tick. Only emits when recv_commit_seq[peer] > last_ack_emitted_to_peer
+// (avoid ACK flood). Prunes pending_ack_sops of completed Sends.
+//
+// This out-of-band timer ACK channel is what makes the PR3c-ii Test()
+// gate viable: even if both sides' Test() stall waiting for peer ACK,
+// the progress thread keeps emitting ACKs independent of payload traffic,
+// eventually unblocking both Tests. AWS uses a fancier flush_stale_acks
+// with GIN_ACK_MAX_AGE timer; we just emit-on-change which is simpler and
+// rate-limited naturally by recv_commit_seq advancement.
+absl::Status CollComm::EmitAck(int peer_rank, ScratchPool* sp) {
+  if (peer_rank < 0 || peer_rank >= static_cast<int>(peers_.size())) {
+    return absl::OkStatus();  // ignore bad rank
+  }
+  if (sp == nullptr) return absl::OkStatus();
+  PeerConn* pc = &peers_[peer_rank];
+
+  // PR3c-iii fix (2026-05-16): serialize all EmitAck access to per-peer
+  // pending_ack_sops + last_ack_emitted_to_peer. Multiple GinCtx per
+  // CollComm (4 in HT EP=16 test) means 4 progress threads call this
+  // concurrently on the same peer; without lock vector erase + push_back
+  // race causes SIGSEGV. Hold for whole function (small body, low contention).
+  absl::MutexLock ack_lock(&ack_mu_);
+
+  // Prune completed in-flight ACKs first.
+  if (!pc->pending_ack_sops.empty()) {
+    auto& vec = pc->pending_ack_sops;
+    vec.erase(std::remove_if(vec.begin(), vec.end(),
+                              [](std::unique_ptr<dxs::SendOpInterface>& op) {
+                                if (op == nullptr) return true;
+                                auto r = op->Test();
+                                // r.has_value() means Test returned (done
+                                // or error). Either way, sop completed.
+                                return r.has_value();
+                              }),
+              vec.end());
+  }
+
+  if (pc->send_socks.empty()) return absl::OkStatus();  // not connected
+  auto* sock = pc->send_socks[0].get();
+  if (sock == nullptr) return absl::OkStatus();
+
+  // Check if we have new info to ACK.
+  auto* atom = recv_commit_seq(peer_rank);
+  if (atom == nullptr) return absl::OkStatus();
+  uint64_t hw = atom->load(std::memory_order_acquire);
+  uint64_t last = pc->last_ack_emitted_to_peer.load(std::memory_order_acquire);
+  // Initial recv_commit_seq is 1 (1-based); skip if hw==1 (no progress) and
+  // last==0 (never emitted before).
+  if (hw <= last) return absl::OkStatus();
+
+  // Cap pending in-flight ACKs to avoid unbounded growth in extreme tail.
+  if (pc->pending_ack_sops.size() > 16) return absl::OkStatus();
+
+  // Build a standalone ACK WireHeader. wire_seq=0 → skip cross-lane
+  // ordering (kWireOpAck has no commit semantics). piggy_ack_high_water
+  // carries the high water; receiver's RunInbound atomic_max'es it into
+  // its peer_acked_high_water[my rank].
+  WireHeader hdr{};
+  hdr.magic = kWireMagic;
+  hdr.op = static_cast<uint16_t>(kWireOpAck);
+  hdr.source_rank = static_cast<uint32_t>(rank_);
+  hdr.dest_rank = static_cast<uint32_t>(peer_rank);
+  hdr.size = 0;
+  hdr.wire_seq = 0;
+  hdr.piggy_ack_high_water = hw;
+
+  // Stage in TX scratch (use a per-thread slot ring to avoid conflict
+  // with IputCommon's tls_tx_seq).
+  static thread_local uint32_t tls_ack_tx_seq[64] = {0};
+  uint32_t slot_idx =
+      tls_ack_tx_seq[peer_rank % 64]++ &
+      static_cast<uint32_t>(kTxSlotsPerPeer - 1);
+  size_t hdr_off = sp->TxSlotOffset(peer_rank, slot_idx);
+  if (sp->host_ptr != nullptr) {
+    std::memcpy(static_cast<uint8_t*>(sp->host_ptr) + hdr_off, &hdr,
+                sizeof(hdr));
+    __asm__ __volatile__("sfence" ::: "memory");
+  } else {
+    cudaError_t cerr = cudaMemcpy(
+        static_cast<uint8_t*>(sp->device_ptr) + hdr_off, &hdr, sizeof(hdr),
+        cudaMemcpyHostToDevice);
+    if (cerr != cudaSuccess) {
+      return absl::InternalError("EmitAck: cudaMemcpy failed");
+    }
+  }
+
+  // Use lane 0's NIC reg (consistent with TickOutbound legacy + ACK is
+  // small so single-lane is fine).
+  int lane_nic_idx =
+      pc->local_nic_idx_for_lane.empty() ? 0 : pc->local_nic_idx_for_lane[0];
+  dxs::Reg hdr_reg = sp->per_nic_reg_handles[lane_nic_idx];
+  if (hdr_reg == 0) hdr_reg = sp->reg_handle;
+  auto sop_or = sock->Send(hdr_off, sizeof(WireHeader), hdr_reg);
+  if (!sop_or.ok()) {
+    return sop_or.status();
+  }
+
+  // Park the SendOp so it stays alive until Send completes.
+  pc->pending_ack_sops.push_back(std::move(*sop_or));
+  pc->last_ack_emitted_to_peer.store(hw, std::memory_order_release);
   return absl::OkStatus();
 }
 

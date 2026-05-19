@@ -24,6 +24,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -84,6 +85,19 @@ struct ListenComm {
 // server worker fan-out absorb pipelining the inline hdr-DONE wait can't.
 // Receivers keep one inbound thread per accepted RecvSocket — total
 // count is N*(nranks-1).
+//
+// PR1 (β port, 2026-05-16): in-flight bitmap ring size for the AWS-style
+// per-peer ACK tracking added in PR3 (PeerConn::active_put_signal). 12-bit
+// modular seq chosen for 16x headroom over the upstream-required
+// NCCL_NET_MAX_REQUESTS * maxRecvs (= 32 * 1 = 32) concurrency floor and
+// 4x headroom over plugin queueDepth=1024 + kTxSlotsPerPeer=1024 caps.
+// AWS uses 8192 (13-bit) for fewer-rail TCP; our PROXY queueDepth caps
+// in-flight strictly below 1024, so 4096 leaves comfortable margin
+// without ballooning bitset memory (4096 bits = 512 B per peer). Distinct
+// from wire_seq_next which is plugin-private cross-lane FIFO ordering
+// (B1 finding, do not conflate).
+constexpr size_t kAckRingSize = 4096;
+
 struct PeerConn {
   std::vector<std::unique_ptr<dxs::SendSocketInterface>> send_socks;
   // v9: parallel to send_socks. local_nic_idx_for_lane[lane] is the local
@@ -98,6 +112,41 @@ struct PeerConn {
   // signal cannot surface until earlier ops on other lanes have committed
   // their data writes). 1-based on the wire (0 means "no seq, no ordering").
   std::atomic<uint64_t> wire_seq_next{1};
+  // PR3a (β port, 2026-05-16): AWS-style ACK protocol state.
+  // Distinct layer from wire_seq_next above:
+  //   - wire_seq_next        = v11 cross-lane FIFO ordering (never resets).
+  //   - next_target_seq_num  = AWS modular sender cursor, mod kAckRingSize.
+  //   - active_put_signal[s] = sender thinks seq `s` is awaiting peer ACK.
+  //   - next_delivered_signal_seq_num = receiver strict in-order cursor;
+  //                            signal raise advances by 1 per retire.
+  //   - consecutive_puts_without_ack  = force-ACK throttle counter (PUT-only
+  //                            batches force ACK every GIN_ACK_INTERVAL).
+  //   - pending_ack          = per-peer bundled-range ACK accumulator
+  //                            (piggybacked into next PutSignal/Put hdr or
+  //                            flushed as standalone kWireOpAck after
+  //                            GIN_ACK_MAX_AGE progress ticks).
+  // All wired in PR3b (sender) and PR3c (receiver + Test() gate); PR3a is
+  // declarative-only and must keep runtime behavior identical to PR1.
+  std::atomic<uint16_t> next_target_seq_num{0};
+  std::bitset<kAckRingSize> active_put_signal;
+  std::atomic<uint16_t> next_delivered_signal_seq_num{0};
+  uint32_t consecutive_puts_without_ack = 0;
+  struct PendingAck {
+    uint16_t seq_num   = 0;
+    uint16_t ack_count = 0;
+    uint32_t age_ticks = 0;
+    bool     linked    = false;
+  } pending_ack;
+  // PR3c-iii (β port, 2026-05-16): async ACK emission state used by
+  // CollComm::EmitAck (called from TickOutbound). last_ack_emitted_to_peer
+  // tracks the high water we last sent to this peer so we only emit when
+  // there is new info (avoid ACK flood). pending_ack_sops holds in-flight
+  // ACK SendOps so the unique_ptrs stay alive until Send completes;
+  // pruned every TickOutbound call. This out-of-band timer ACK channel
+  // is what breaks the PR3c-ii circular deadlock — sender's Test() gate
+  // gets ACK updates even when wrapper credit is stuck.
+  std::atomic<uint64_t> last_ack_emitted_to_peer{0};
+  std::vector<std::unique_ptr<dxs::SendOpInterface>> pending_ack_sops;
   PeerConn() = default;
   PeerConn(const PeerConn&) = delete;
   PeerConn& operator=(const PeerConn&) = delete;
@@ -105,7 +154,17 @@ struct PeerConn {
       : send_socks(std::move(o.send_socks)),
         local_nic_idx_for_lane(std::move(o.local_nic_idx_for_lane)),
         tx_seq(o.tx_seq.load(std::memory_order_relaxed)),
-        wire_seq_next(o.wire_seq_next.load(std::memory_order_relaxed)) {}
+        wire_seq_next(o.wire_seq_next.load(std::memory_order_relaxed)),
+        next_target_seq_num(
+            o.next_target_seq_num.load(std::memory_order_relaxed)),
+        active_put_signal(o.active_put_signal),
+        next_delivered_signal_seq_num(
+            o.next_delivered_signal_seq_num.load(std::memory_order_relaxed)),
+        consecutive_puts_without_ack(o.consecutive_puts_without_ack),
+        pending_ack(o.pending_ack),
+        last_ack_emitted_to_peer(
+            o.last_ack_emitted_to_peer.load(std::memory_order_relaxed)),
+        pending_ack_sops(std::move(o.pending_ack_sops)) {}
   PeerConn& operator=(PeerConn&& o) noexcept {
     send_socks = std::move(o.send_socks);
     local_nic_idx_for_lane = std::move(o.local_nic_idx_for_lane);
@@ -113,8 +172,39 @@ struct PeerConn {
                  std::memory_order_relaxed);
     wire_seq_next.store(o.wire_seq_next.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
+    next_target_seq_num.store(
+        o.next_target_seq_num.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    active_put_signal = o.active_put_signal;
+    next_delivered_signal_seq_num.store(
+        o.next_delivered_signal_seq_num.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    consecutive_puts_without_ack = o.consecutive_puts_without_ack;
+    pending_ack = o.pending_ack;
+    last_ack_emitted_to_peer.store(
+        o.last_ack_emitted_to_peer.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    pending_ack_sops = std::move(o.pending_ack_sops);
     return *this;
   }
+};
+
+// PR3a (β port, 2026-05-16): per-outstanding-(peer, seq) receiver state for
+// AWS-style in-order signal raise. Map key = (uint64_t(peer_rank) << 16) |
+// seq_num (mirrors AWS nccl_ofi_gin.cpp:739-742). When num_seg_completions
+// == total_segments AND metadata_received, the op becomes "deliverable";
+// retire_completed_peer_iput_ops (added in PR3c) walks the per-peer
+// next_delivered_signal_seq_num cursor in strict order and raises signals
+// only when contiguous. Out-of-order seqs wait. Wired in PR3c.
+struct RecvReqState {
+  uint16_t total_segments      = 0;
+  uint16_t num_seg_completions = 0;
+  bool     metadata_received   = false;
+  bool     is_ack_requested    = false;
+  uint64_t signal_handle       = 0;
+  uint64_t signal_off          = 0;
+  uint64_t signal_val          = 0;
+  uint16_t signal_op           = 0;  // 0 = none, 1 = INC, 2 = ADD
 };
 
 // Default fan-out per peer; can be overridden via NCCL_GIN_FANOUT env var.
@@ -280,6 +370,27 @@ class CollComm {
   // in wire_seq order; GPU atomicAdd handles cross-source atomicity.
   cudaStream_t signal_stream();
 
+  // PR3c-ii (β port, 2026-05-16): accessor for the per-dst peer ack
+  // high water array. Returns nullptr for out-of-range or before Init.
+  // Read by Test() to gate; written by RunInbound via atomic_max.
+  std::atomic<uint64_t>* peer_acked_high_water(int dst_rank) {
+    if (dst_rank < 0 ||
+        dst_rank >= static_cast<int>(peer_acked_high_water_n_) ||
+        peer_acked_high_water_ == nullptr)
+      return nullptr;
+    return &peer_acked_high_water_[dst_rank];
+  }
+
+  // PR3c-iii (β port, 2026-05-16): emit a standalone kWireOpAck wire op
+  // to `peer_rank` carrying our current recv_commit_seq[peer_rank] in
+  // hdr.piggy_ack_high_water. Best-effort: returns OK if no new info to
+  // ACK (idempotent), or if peer not yet connected. Called from
+  // TickOutbound on every progress tick. This is the async out-of-band
+  // ACK channel that breaks PR3c-ii circular deadlock — does NOT depend
+  // on bidirectional payload traffic; works even when wrapper credit
+  // stuck and no GFD posted.
+  absl::Status EmitAck(int peer_rank, ScratchPool* sp);
+
   // v11: per-source-rank "next seq to commit" counter. The receiver uses
   // this to enforce cross-lane post-payload ordering when fanout > 1: an
   // inbound thread receives op with hdr.wire_seq==S, finishes the payload
@@ -344,6 +455,15 @@ class CollComm {
 
   // v7 (S3): see signal_mu() comment above.
   absl::Mutex signal_mu_;
+
+  // PR3c-iii fix (2026-05-16): protect EmitAck access to per-peer
+  // pending_ack_sops + last_ack_emitted_to_peer. Multiple GinCtx per
+  // CollComm (test shows 4) -> 4 progress threads -> 4 concurrent EmitAck
+  // on same peer -> race on vector erase + push_back -> SIGSEGV.
+  // Single CollComm-wide mutex (vs per-peer) keeps it simple; EmitAck
+  // body is small + only called from progress threads, so contention
+  // negligible.
+  absl::Mutex ack_mu_;
   cudaStream_t signal_stream_ = nullptr;  // v20
 
   // v11: per-source-rank receive-side commit-order counter. Sized to
@@ -351,6 +471,22 @@ class CollComm {
   // unique_ptr array. Inbound threads read recv_commit_seq_[src_rank].
   std::unique_ptr<std::atomic<uint64_t>[]> recv_commit_seq_;
   size_t recv_commit_seq_n_ = 0;
+
+  // PR3c-ii (β port, 2026-05-16): per-dst peer ack high water. Init 0
+  // = sentinel "no ack from this dst yet"; Test() bypasses gate then.
+  std::unique_ptr<std::atomic<uint64_t>[]> peer_acked_high_water_;
+  size_t peer_acked_high_water_n_ = 0;
+
+  // PR3a (β port, 2026-05-16): per-CollComm map of outstanding
+  // (peer_rank, seq_num) -> RecvReqState. Key encoding mirrors AWS
+  // nccl_ofi_gin.cpp:739-742: (uint64_t(peer_rank) << 16) | seq_num.
+  // Inserted by inbound RX handlers (PR3c), removed by
+  // retire_completed_peer_iput_ops (PR3c). Guarded by outstanding_reqs_mu_
+  // because the receiver progress thread (inserting) and ack-emit code
+  // (potentially erasing) run on different threads.
+  absl::Mutex outstanding_reqs_mu_;
+  absl::flat_hash_map<uint64_t, RecvReqState> outstanding_iput_signal_recv_reqs
+      ABSL_GUARDED_BY(outstanding_reqs_mu_);
 };
 
 // Per createContext() instance: owns the GPU-visible proxy context and the
