@@ -1,0 +1,15 @@
+# Full upstream NCCL source clone with debug patch — too large for git.
+# The actual debug patch is captured in d1_nccl_patch.patch at repo root.
+nccl_debug_d1/
+
+# Plugin build output (regenerated per build)
+plugin/build_deploy/
+
+# Editor / OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+__pycache__/
+*.pyc
+*.bak.*

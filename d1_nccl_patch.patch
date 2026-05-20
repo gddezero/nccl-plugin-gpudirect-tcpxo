@@ -1,0 +1,79 @@
+--- src/gin/gin_host_proxy.cc.bak.20260520_180000	2026-05-20 06:29:07.341161992 +0000
++++ src/gin/gin_host_proxy.cc	2026-05-20 06:30:07.129112859 +0000
+@@ -119,6 +119,8 @@
+             return res;
+         }
+         if (state->done) {
++          INFO(NCCL_NET, "[D1] GFD completed ctx#%d tgt=%d stateIdx=%lu req=%p",
++               hostGpuCtx->contextId, targetRank, state - hostGpuCtx->states, state->request);
+           TRACE(NCCL_NET, "GFD completed - contextId: %d, stateIdx: %lu, request: %p", hostGpuCtx->contextId, state - hostGpuCtx->states,
+                 state->request);
+           // update the counter specified in the GFD
+@@ -236,6 +238,8 @@
+     void *signalHandle = (void *)(uint64_t)gfd->qword[ncclGinProxyGfdVASignalHandle].vaSignalHandle.vaSignalHandle;
+     signalVal = extractSignalVal(gfd);
+     signalOp = mapGfdOpToSignalOp(gfd);
++    INFO(NCCL_NET, "[D1] dispatch->plugin iputSignal(VASIG) ctx#%d tgt=%d signalOff=%lu signalVal=%lu signalOp=%d",
++         hostGpuCtx->contextId, targetRank, signalOff, signalVal, signalOp);
+     NCCLCHECK(ginBackend->iputSignal(ctx->ginCtx, hostGpuCtx->contextId, 0, nullptr, 0, 0, nullptr,
+                                   targetRank, signalOff, signalHandle, signalVal,
+                                   signalOp, &state->request));
+@@ -252,6 +256,7 @@
+       WARN("GIN plugin does not support GET");
+       return ncclInvalidUsage;
+     }
++    INFO(NCCL_NET, "[D1] dispatch->plugin iget ctx#%d tgt=%d size=%lu", hostGpuCtx->contextId, targetRank, size);
+     NCCLCHECK(ginBackend->iget(ctx->ginCtx, hostGpuCtx->contextId, srcOff, srcHandle, size, dstOff, dstHandle,
+                               targetRank, &state->request));
+     return ncclSuccess;
+@@ -262,6 +267,7 @@
+       WARN("GIN plugin does not support FLUSH");
+       return ncclInvalidUsage;
+     }
++    INFO(NCCL_NET, "[D1] dispatch->plugin iflush ctx#%d tgt=%d", hostGpuCtx->contextId, targetRank);
+     NCCLCHECK(ginBackend->iflush(ctx->ginCtx, hostGpuCtx->contextId, ctx->signalsGinHandle, targetRank,&state->request));
+     if (state->request == NULL) {
+       state->done = 1;
+@@ -294,6 +300,7 @@
+     case ncclGinProxyOpPut:
+       signalOp = mapGfdOpToSignalOp(gfd);
+       if (signalOp == -1) {
++        INFO(NCCL_NET, "[D1] dispatch->plugin iput ctx#%d tgt=%d size=%lu", hostGpuCtx->contextId, targetRank, size);
+         // First cast from 63 bits to 64 bits and then to void * to avoid warnings
+         NCCLCHECK(ginBackend->iput(ctx->ginCtx, hostGpuCtx->contextId, srcOff, srcHandle, size, dstOff, dstHandle,
+                                 targetRank, &state->request));
+@@ -302,6 +309,8 @@
+         signalVal = extractSignalVal(gfd);
+         uint64_t signalOff = (gfd->qword[ncclGinProxyGfdCompletion].completion.signalId +
+                               hostGpuCtx->contextId * ctx->nSignalsPerContext) * sizeof(uint64_t);
++        INFO(NCCL_NET, "[D1] dispatch->plugin iputSignal ctx#%d tgt=%d size=%lu signalOff=%lu signalVal=%lu signalOp=%d",
++             hostGpuCtx->contextId, targetRank, size, signalOff, signalVal, signalOp);
+         NCCLCHECK(ginBackend->iputSignal(ctx->ginCtx, hostGpuCtx->contextId, srcOff, srcHandle, size, dstOff, dstHandle,
+                                       targetRank, signalOff, ctx->signalsGinHandle, signalVal,
+                                       signalOp, &state->request));
+@@ -588,6 +597,14 @@
+ static ncclResult_t ncclGinProxyProgress(void *ginCtx) {
+   struct ginProxyCtx *ctx = (struct ginProxyCtx *)ginCtx;
+ 
++  // [D1] invocation counter — confirms progress thread is running
++  static thread_local uint64_t d1_progress_calls = 0;
++  if (d1_progress_calls < 10 || (d1_progress_calls % 100000) == 0) {
++    INFO(NCCL_NET, "[D1] ncclGinProxyProgress call#%lu nContexts=%d nRanks=%d ctx=%p",
++         d1_progress_calls, ctx->nContexts, ctx->nRanks, ctx);
++  }
++  d1_progress_calls++;
++
+   for (int contextId = 0; contextId < ctx->nContexts; contextId++) {
+     struct ginProxyHostGpuCtx *hostGpuCtx = ctx->hostGpuCtx + contextId;
+     NCCLCHECK(proxyGinPollCompletions(ctx->collComm, ctx, hostGpuCtx));
+@@ -596,6 +613,10 @@
+       ncclGinProxyGfd_t gfd;
+       struct ginProxyGfdState *state = NULL;
+       if (proxyGinPollGfd(ctx, hostGpuCtx, targetRank, &gfd, &state)) {
++        // [D1] GFD discovered in queue
++        INFO(NCCL_NET, "[D1] GFD found ctx#%d tgtRank=%d sis=%u cisShadow=%u op=0x%lx",
++             contextId, targetRank, hostGpuCtx->sis[targetRank], hostGpuCtx->cisShadow[targetRank],
++             (uint64_t)state->op);
+         ncclResult_t ret =
+           proxyGinProcessGfd(ctx, hostGpuCtx, targetRank, &gfd, state);
+         if (ret) ctx->hasError = ret;
