@@ -377,7 +377,7 @@ epv2_gin/                                  ← 新 git branch "epv2-gin-from-scr
 └── tests/                                 ← 各 milestone 验证脚本
 ```
 
-操作记录：所有改动写到 `/home/admin_maxwellx_altostrat_com/code/tencent_h100/operation_history_v2.md`（项目根，新文件）；老的 `operation_history.md` 不再追加。所有 binary 跨节点部署后必须 `md5sum` 验证两节点。**不**修改 `/work/DeepEP_v2/` 已 build 的源、**不**在 `~/deepep_dev/tcpxo-fork/` 上做任何改动。
+操作记录：所有改动写到项目根的 `operation_history_v2.md`（新文件）；老的 `operation_history.md` 不再追加。所有 binary 跨节点部署后必须 `md5sum` 验证两节点。**不**修改容器内已 build 的 `DeepEP_v2` 源、**不**在历史 plugin fork 上做任何改动。
 
 ---
 

@@ -1,0 +1,51 @@
+nccl-plugin-gpudirect-tcpxo
+Copyright 2026 nccl-plugin-gpudirect-tcpxo authors
+
+This product includes software developed by other parties:
+
+================================================================================
+NVIDIA Collective Communication Library (NCCL) plugin ABI headers
+--------------------------------------------------------------------------------
+Path:    plugin/include/nccl_plugin_abi/
+Source:  https://github.com/NVIDIA/nccl  (release 2.30.4-1)
+License: Apache License, Version 2.0
+Notice:  Headers are vendored verbatim from NCCL's `src/include/plugin/`
+         tree under the BSD/Apache 2.0 dual-licensed `plugin/` subdir
+         (NCCL declares plugin interface as Apache 2.0). See:
+           https://github.com/NVIDIA/nccl/blob/v2.30.4-1/LICENSE.txt
+         The files are unmodified from upstream.
+Copyright (c) NVIDIA Corporation.
+
+================================================================================
+NCCL debug patch (d1_nccl_patch.patch)
+--------------------------------------------------------------------------------
+Path:    d1_nccl_patch.patch (~80 lines of additions to src/gin/gin_host_proxy.cc)
+Target:  https://github.com/NVIDIA/nccl  v2.30.4-1
+License: Apache License, Version 2.0 (matches upstream NCCL)
+Notice:  Adds INFO-level logging for D1 diagnosis. Not a runtime requirement
+         for the plugin; only used for debugging the NCCL GIN PROXY chain.
+
+================================================================================
+GDRCopy
+--------------------------------------------------------------------------------
+Linked at runtime (libgdrapi.so) and headers (gdrapi.h) used at build time.
+Not vendored in this repo. See:
+  https://github.com/NVIDIA/gdrcopy  (MIT License)
+Copyright (c) NVIDIA Corporation.
+
+================================================================================
+CUDA Runtime API
+--------------------------------------------------------------------------------
+Linked at runtime (libcudart) and headers used at build time. Not vendored.
+CUDA Toolkit EULA applies for the runtime. See:
+  https://docs.nvidia.com/cuda/eula/index.html
+Copyright (c) NVIDIA Corporation.
+
+================================================================================
+DeepEP / DeepEP_v2
+--------------------------------------------------------------------------------
+No DeepEP source is vendored in this repo. Tests in plugin/tests/run_test_*.sh
+launch DeepEP_v2's `tests/elastic/test_*.py` from an external installation.
+DeepEP is published by DeepSeek-AI under MIT License:
+  https://github.com/deepseek-ai/DeepEP
+================================================================================

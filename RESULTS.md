@@ -39,7 +39,7 @@ CUDA documents `cudaStreamNonBlocking` as opting out of default-stream sync, but
 ## Architecture
 
 ```
-                ┌─────────── rank 0 (forrest-h100-01) ───────────┐
+                ┌─────────── rank 0 (node-a) ───────────┐
                 │                                                │
    DeepEP elastic kernel                                         │
         │                                                        │
@@ -59,10 +59,10 @@ CUDA documents `cudaStreamNonBlocking` as opting out of default-stream sync, but
    │      └── apply_recv → gdr_copy_to_mapping (data + signal)  │
    └── handle_get_request → do_send OP_PUT reply with req_id    │
                                                                  │
-                                  eth1 (10.128.0.x/32)           │
+                                  eth1 (e.g. 10.x.y.z/32, your own subnet)           │
                                   TCP single-stream              │
                                                                  │
-                ┌─────────── rank 1 (forrest-h100-02) ───────────┘
+                ┌─────────── rank 1 (node-b) ───────────┘
                 │                                                │
                                   (mirror)                       │
                                                                  │
@@ -152,14 +152,14 @@ make src.build TRACE=1 -j$(nproc)
 On node B (rank 1):
 ```bash
 cd /work/epv2_gin_plugin/tests
-RANK=1 WORLD_SIZE=2 MASTER_ADDR=10.128.0.3 MASTER_PORT=29550 N_LOCAL=1 \
+RANK=1 WORLD_SIZE=2 MASTER_ADDR=$NODE_A_ETH1_IP MASTER_PORT=29550 N_LOCAL=1 \
   bash run_test_pp_d1.sh
 ```
 
 On node A (rank 0), simultaneously:
 ```bash
 cd /work/epv2_gin_plugin/tests
-RANK=0 WORLD_SIZE=2 MASTER_ADDR=10.128.0.3 MASTER_PORT=29550 N_LOCAL=1 \
+RANK=0 WORLD_SIZE=2 MASTER_ADDR=$NODE_A_ETH1_IP MASTER_PORT=29550 N_LOCAL=1 \
   bash run_test_pp_d1.sh
 ```
 
