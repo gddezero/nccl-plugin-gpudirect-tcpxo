@@ -167,7 +167,9 @@ Substitute `run_test_{barrier,engram,ep}_d1.sh` for the other tests. `run_test_a
 
 ---
 
-## Performance (M2 / test_pp, 16 KB tensors, 2 nodes × 1 rank, eth1)
+## Performance — full test suite on 2 × a3-megagpu-8g (2 nodes × 1 rank, eth1)
+
+### test_pp — fixed message size (16 KB), hide × concurrent sweep
 
 | hide_rdma_latency | concurrent | send µs | send GB/s | recv µs | recv GB/s |
 |---|---|---|---|---|---|
@@ -180,18 +182,55 @@ Substitute `run_test_{barrier,engram,ep}_d1.sh` for the other tests. `run_test_a
 
 `send` is enqueue latency (kernel returns once GFD is in queue), not real transfer time. `recv` is the actual round-trip latency. Real bandwidth ≈ recv column.
 
-### Bottleneck attribution
+### test_pp — tensor-size sweep (hide=1, concurrent=3 = peak row per size)
+
+Same 2 × a3-megagpu-8g, same plugin, only `TOKENS × HIDDEN` (bf16) changes. `send GB/s` grows linearly with size because it is `size / enqueue_latency`, not transfer rate.
+
+| message size | send µs | send GB/s | recv µs | **recv GB/s** |
+|---:|---:|---:|---:|---:|
+| 4 KB    | 8.92  |   0.92 |   40.66 | **0.20** |
+| 16 KB   | 9.07  |   3.61 |   72.38 | **0.45** |
+| 64 KB   | 9.01  |  14.55 |  194.64 | **0.67** |
+| 256 KB  | 9.15  |  57.33 |  746.57 | **0.70** |
+| 1 MB    | 9.70  | 216.13 | 1895.00 | **1.11** |
+
+**Take-away:** the per-op overhead floor (≈ 35–50 µs of GDRCopy + signal RMW + TCP syscall + recv_thread wakeup) dominates at small sizes; once messages clear ~256 KB the cost amortises and the single-NIC / single-stream TCP fabric cap takes over at **~1.1 GB/s**.
+
+### Other elastic tests
+
+| Test | Result | Headline numbers |
+|---|---|---|
+| `test_barrier.py`  | ✅ pass | **~35 µs per barrier** (single iter); ~75 µs/barrier over a 1000-iter run |
+| `test_engram.py`   | ✅ pass | issue **271 µs** + wait **2704 µs** for 256-token / 128-hidden iget; **0.09 MPPS** at 256 B/msg |
+| `test_ep.py` (with perf) | ✅ correctness | dispatch / combine / reduced-combine / cached-dispatch / expanded-dispatch all run and validate; final perf-summary line trips a `num_scaleout_bytes / t` div-by-zero **inside the DeepEP test harness itself** — cosmetic, not a plugin defect |
+| `test_agrs.py`     | ⊘ N/A | DeepEP asserts `nvl_ranks == num_ranks` — intra-node only, not satisfiable with 2 × 1 |
+
+### Bottleneck attribution (recv side)
 
 | Layer | Cost / contribution |
 |---|---|
-| GDRCopy 16 KB H→D + 2× 8 B signal RMW | ~24 µs |
-| TCP sendmsg/recvmsg syscall + poll() | ~10 µs |
-| Single TCP stream over eth1 (single GCP NIC) | caps at ~1.8 Gbps in practice |
-| Plugin recv_thread is single-threaded | serializes inflight ops |
+| GDRCopy *N* B H→D + 2× 8 B signal RMW | ~6–10 µs (constant + ~1 µs/KB above 64 KB) |
+| TCP `recvmsg` syscall + `poll()` wake-up | ~10 µs |
+| Single `recv_thread` services all peers | serializes inflight ops |
+| Single TCP stream over one `eth1` NIC | caps real recv at **~1.1 GB/s** at 1 MB messages |
 
 Switching `NCCL_SOCKET_IFNAME` from eth0 to eth1 made **no measurable throughput difference** (both saturate at the same single-stream TCP cap). The eth0 → eth1 switch was for correctness / cleanliness, not speed.
 
-Real upgrade path is **libfastrak (TCPXO GPU-direct)** — same data plane production NCCL uses for 227 GB/s busbw on a3-mega. That is a multi-week rewrite of the data plane, not patches to the current plugin. Out of scope for this milestone.
+Real upgrade path is **libfastrak (TCPXO GPU-direct)** — same data plane production NCCL uses for 227 GB/s busbw on a3-mega. That is a multi-week rewrite of the data plane, not patches to the current plugin. An interim step that stays inside the current TCP+GDRCopy architecture is sharding traffic across `eth1`..`eth8` with one `recv_thread` per NIC (theoretical ~8× headroom, in practice gated by GDRCopy serialisation and per-peer dependencies — see "Recv optimisation paths" below).
+
+### Recv optimisation paths (incremental, no fabric change)
+
+Ordered roughly by expected payoff at large message sizes:
+
+1. **Shard connections across eth1..eth8** + one `recv_thread` per NIC. Hash on `(src_rank, dst_token)` or pin a peer to a NIC. Theoretical 8× recv throughput (each GPUDirect NIC is its own 25-Gbps pipe); real gain limited by the `apply_recv` critical section and by GDRCopy throughput.
+2. **Per-peer `recv_thread`** even on the same NIC: removes the head-of-line block where a slow peer's `apply_recv` stalls the others.
+3. **`recvmmsg` / `sendmmsg` batching** when there are queued GFDs for the same peer: one syscall per N small messages instead of N syscalls.
+4. **Coalesce per-op `WireMsgHdr`** for back-to-back ops to the same destination, so a 4 KB op stops paying 68 bytes (~1.6%) of header overhead and one full syscall round-trip.
+5. **Replace `poll()` with `epoll(7)` (or `io_uring`)** in `recv_thread`; once there are 8+ peers the `poll()` scan dominates wake-up cost.
+6. **TCP socket tuning** (`TCP_NODELAY`, larger `SO_SNDBUF/SO_RCVBUF`, BBR). Already partly on by default in NGC kernels, but worth measuring.
+7. **GDRCopy persistent mapping reuse**: amortise `gdr_pin_buffer` cost across the lifetime of an MR (we already do this); revisit if the test ever creates short-lived MRs.
+
+`libfastrak` remains the only path to >>10 GB/s; the items above are bounded by ~10–20 GB/s aggregate even when stacked.
 
 ---
 

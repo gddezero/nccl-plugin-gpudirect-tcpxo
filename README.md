@@ -68,6 +68,20 @@ Latencies are reported per direction. `send` is the enqueue cost (kernel returns
 
 **Peak observed:** ~**0.42 GB/s** real bidirectional throughput at `concurrent=2..3` with `hide_rdma_latency=1`.
 
+### `test_pp` tensor-size sweep (hide=1, concurrent=3, per-size peak row)
+
+Same hardware, same plugin, only `TOKENS × HIDDEN` (bf16) changes.
+
+| message size | send µs | send GB/s | recv µs | **recv GB/s** |
+|---:|---:|---:|---:|---:|
+| 4 KB    | 8.92  |   0.92 |   40.66 | **0.20** |
+| 16 KB   | 9.07  |   3.61 |   72.38 | **0.45** |
+| 64 KB   | 9.01  |  14.55 |  194.64 | **0.67** |
+| 256 KB  | 9.15  |  57.33 |  746.57 | **0.70** |
+| 1 MB    | 9.70  | 216.13 | 1895.00 | **1.11** |
+
+Small messages are dominated by a ~35–50 µs per-op overhead (GDRCopy + signal RMW + TCP syscall + recv\_thread wakeup); once that amortises, the single-NIC / single-stream TCP fabric cap takes over at **~1.1 GB/s**.
+
 ### `test_barrier` (2 nodes × 1 rank)
 
 | Metric | Value |
