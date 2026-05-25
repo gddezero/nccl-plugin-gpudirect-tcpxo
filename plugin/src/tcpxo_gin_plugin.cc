@@ -82,7 +82,8 @@ static const char* env_or(const char* k, const char* fallback) {
 
 namespace {
 
-constexpr uint32_t WIRE_MAGIC = 0x47494E58u; // "GINX"
+constexpr uint32_t WIRE_MAGIC = 0x47494E58u;     // "GINX" — WireMsgHdr
+constexpr uint32_t HANDLE_MAGIC_V2 = 0x47494E32u; // "GIN2" — multi-NIC handle
 constexpr uint8_t  OP_PUT        = 1;
 constexpr uint8_t  OP_PUT_SIGNAL = 2;
 // iget protocol: requester sends OP_GET with signal_token/signal_off pointing
@@ -114,6 +115,12 @@ static_assert(sizeof(WireMsgHdr) == 68, "WireMsgHdr layout");
 
 constexpr size_t kStageBufBytes = 64ull * 1024 * 1024; // hard cap per iput
 
+// Multi-NIC sharding: open one TCP connection per (peer, NIC) and one
+// recv_thread per NIC, so traffic is striped across eth1..eth8. The cap is
+// fixed at compile time so the handle (sent over the bootstrap channel)
+// stays a small POD; current a3-mega has 8 GPUDirect NICs.
+constexpr int kMaxNics = 8;
+
 // ---------------------------------------------------------------------------
 // Plugin state
 // ---------------------------------------------------------------------------
@@ -121,8 +128,10 @@ constexpr size_t kStageBufBytes = 64ull * 1024 * 1024; // hard cap per iput
 struct PluginCtx {
   uint64_t commId{0};
   std::atomic<bool> initialized{false};
-  std::string iface;
-  in_addr_t local_ip{0}; // network byte order
+  // NCCL_SOCKET_IFNAMES is preferred (comma-separated); single
+  // NCCL_SOCKET_IFNAME still works and is treated as a one-element list.
+  std::vector<std::string> ifaces;
+  std::vector<in_addr_t> local_ips; // network byte order, parallel to ifaces
   gdr_t gdr{nullptr};    // GDRCopy handle (opened lazily on first CUDA regMrSym)
   std::mutex gdr_mu;
 };
@@ -143,25 +152,33 @@ struct MrRecord {
   size_t gdr_mapped_size{0};
 };
 
+// Bootstrap handle carries one (ip, port) per NIC the listener bound.
+// Bumped to V2 (new magic) so a stale single-NIC build can't half-handshake
+// with a multi-NIC build. Layout: 4 magic + 4 n_nics + 8 * (4 ip + 4 port)
+// = 72 bytes, well under NCCL_NET_HANDLE_MAXSIZE (128).
 struct ListenHandleV1 {
   uint32_t magic;
-  uint32_t pad;
-  uint32_t ip;   // network byte order (in_addr_t)
-  uint16_t port; // network byte order
-  uint16_t pad2;
-  uint8_t reserved[112];
+  uint32_t n_nics;       // 1..kMaxNics, # of NICs the listener actually bound
+  struct {
+    uint32_t ip;         // network byte order (in_addr_t)
+    uint32_t port;       // network byte order, widened from uint16_t for align
+  } endpoints[kMaxNics];
+  uint8_t reserved[NCCL_NET_HANDLE_MAXSIZE - 8 - 8 * kMaxNics];
 };
 static_assert(sizeof(ListenHandleV1) == NCCL_NET_HANDLE_MAXSIZE,
               "ListenHandle must be 128 bytes");
 
 struct ListenComm {
-  int fd{-1};
+  int fds[kMaxNics];     // -1 if NIC not bound (only fds[0..n_nics-1] valid)
+  int n_nics{0};
   int dev{0};
+  ListenComm() { for (int i = 0; i < kMaxNics; ++i) fds[i] = -1; }
 };
 
 struct PeerLink {
-  int fd{-1};
-  std::mutex send_mu;
+  int fds[kMaxNics];     // one connection per NIC, -1 if not connected
+  std::mutex send_mus[kMaxNics];
+  PeerLink() { for (int i = 0; i < kMaxNics; ++i) fds[i] = -1; }
 };
 
 struct Request {
@@ -187,16 +204,27 @@ struct CollComm {
   //  at NCCL's first GIN-touching call. Even if it had run, it could not have
   //  unblocked NCCL because NCCL never calls our test() to begin with.)
 
-  // recv side
-  std::thread recv_thread;
+  // recv side — one thread + one wakeup pipe per NIC.
+  int n_nics{1};
+  std::thread recv_threads[kMaxNics];
   std::atomic<bool> running{false};
-  int wakeup_pipe[2]{-1, -1}; // self-pipe to wake poll() during shutdown
+  int wakeup_pipes[kMaxNics][2]; // self-pipe to wake poll() during shutdown
 
-  // staging buffers (host pinned)
-  void* recv_stage{nullptr};
-  void* send_stage{nullptr};
+  // Per-NIC staging buffers (host pinned). Separate buffers and mutexes
+  // remove the single-stage_mu bottleneck so sends on NIC i don't wait on
+  // sends on NIC j. recv_stages[i] is owned exclusively by recv_threads[i].
+  void* recv_stages[kMaxNics];
+  void* send_stages[kMaxNics];
+  std::mutex send_stage_mus[kMaxNics];
   size_t stage_bytes{kStageBufBytes};
-  std::mutex send_stage_mu;
+
+  CollComm() {
+    for (int i = 0; i < kMaxNics; ++i) {
+      wakeup_pipes[i][0] = wakeup_pipes[i][1] = -1;
+      recv_stages[i] = nullptr;
+      send_stages[i] = nullptr;
+    }
+  }
 
   // signal scratch (8B host pinned, single owner = recv thread)
   void* signal_scratch{nullptr};
@@ -487,22 +515,27 @@ static int handle_get_request(CollComm* cc, const WireMsgHdr& greq, int src_rank
   return 0;
 }
 
-static void recv_thread_fn(CollComm* cc) {
-  // Bind this thread to CUDA device 0. Required before any cudaMemcpyAsync —
-  // a freshly spawned std::thread has no current CUDA context.
+// One recv_thread per NIC. Only polls fds for connections on this NIC,
+// using this NIC's staging buffer. apply_recv() may still touch shared MR
+// state but takes its own mutexes; signal RMWs already use cc->signal_stream
+// which is shared but each enqueue is small and serialized via the cudaStream.
+static void recv_thread_fn(CollComm* cc, int nic_idx) {
   cudaError_t set_ce = cudaSetDevice(0);
   if (set_ce != cudaSuccess) {
-    WARN("recv_thread_fn: cudaSetDevice failed: %s", cudaGetErrorString(set_ce));
+    WARN("recv_thread_fn[nic=%d]: cudaSetDevice failed: %s",
+         nic_idx, cudaGetErrorString(set_ce));
   }
   std::vector<pollfd> pfds;
   pfds.reserve(cc->nranks + 1);
+  void* recv_stage = cc->recv_stages[nic_idx];
+  int wakeup_rd = cc->wakeup_pipes[nic_idx][0];
   while (cc->running.load(std::memory_order_acquire)) {
     pfds.clear();
-    pollfd wp = {cc->wakeup_pipe[0], POLLIN, 0};
+    pollfd wp = {wakeup_rd, POLLIN, 0};
     pfds.push_back(wp);
     for (int r = 0; r < cc->nranks; ++r) {
       if (r == cc->rank) continue;
-      int fd = cc->peers[r]->fd;
+      int fd = cc->peers[r]->fds[nic_idx];
       if (fd < 0) continue;
       pollfd pe = {fd, POLLIN, 0};
       pfds.push_back(pe);
@@ -510,15 +543,13 @@ static void recv_thread_fn(CollComm* cc) {
     int rc = ::poll(pfds.data(), pfds.size(), 500); // 500ms tick
     if (rc < 0) {
       if (errno == EINTR) continue;
-      WARN("recv_thread: poll() failed: %s", std::strerror(errno));
+      WARN("recv_thread[nic=%d]: poll() failed: %s", nic_idx, std::strerror(errno));
       break;
     }
     if (rc == 0) continue;
-    // Drain wakeup pipe (if any)
     if (pfds[0].revents & POLLIN) {
       char trash[64];
-      while (::read(cc->wakeup_pipe[0], trash, sizeof(trash)) > 0) {
-      }
+      while (::read(wakeup_rd, trash, sizeof(trash)) > 0) {}
     }
     for (size_t i = 1; i < pfds.size(); ++i) {
       if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
@@ -527,55 +558,47 @@ static void recv_thread_fn(CollComm* cc) {
       int r = read_all(fd, &h, sizeof(h));
       static std::atomic<uint64_t> g_rt_hdr_calls{0};
       uint64_t rtc = ++g_rt_hdr_calls;
-      INFO("PATHB recv_thread #%lu fd=%d read_rc=%d magic=0x%x op=%u size=%lu sigOp=%u sigOff=%lu",
-           rtc, fd, r, (unsigned)h.magic, (unsigned)h.op,
+      INFO("PATHB recv_thread[nic=%d] #%lu fd=%d read_rc=%d magic=0x%x op=%u size=%lu sigOp=%u sigOff=%lu",
+           nic_idx, rtc, fd, r, (unsigned)h.magic, (unsigned)h.op,
            (unsigned long)h.size, (unsigned)h.signal_op,
            (unsigned long)h.signal_off);
-      if (r != 0) {
-        if (cc->running.load()) {
-          WARN("recv_thread: read hdr failed on fd=%d rc=%d (%s)",
-               fd, r, std::strerror(errno));
-        }
-        // Close and forget. We don't try to repair connections in M2.
+      auto forget_fd = [&]() {
         ::close(fd);
         for (int p = 0; p < cc->nranks; ++p) {
-          if (cc->peers[p]->fd == fd) cc->peers[p]->fd = -1;
+          if (cc->peers[p]->fds[nic_idx] == fd) cc->peers[p]->fds[nic_idx] = -1;
         }
+      };
+      if (r != 0) {
+        if (cc->running.load()) {
+          WARN("recv_thread[nic=%d]: read hdr failed on fd=%d rc=%d (%s)",
+               nic_idx, fd, r, std::strerror(errno));
+        }
+        forget_fd();
         continue;
       }
       if (h.magic != WIRE_MAGIC) {
-        WARN("recv_thread: bad magic 0x%x", h.magic);
-        ::close(fd);
-        for (int p = 0; p < cc->nranks; ++p) {
-          if (cc->peers[p]->fd == fd) cc->peers[p]->fd = -1;
-        }
+        WARN("recv_thread[nic=%d]: bad magic 0x%x", nic_idx, h.magic);
+        forget_fd();
         continue;
       }
       if (h.size > cc->stage_bytes) {
-        WARN("recv_thread: oversized msg size=%lu cap=%zu", h.size,
-             cc->stage_bytes);
-        ::close(fd);
-        for (int p = 0; p < cc->nranks; ++p) {
-          if (cc->peers[p]->fd == fd) cc->peers[p]->fd = -1;
-        }
+        WARN("recv_thread[nic=%d]: oversized msg size=%lu cap=%zu",
+             nic_idx, h.size, cc->stage_bytes);
+        forget_fd();
         continue;
       }
       if (h.size > 0 && h.op != OP_GET) {
-        if (read_all(fd, cc->recv_stage, h.size) != 0) {
-          WARN("recv_thread: read payload failed");
-          ::close(fd);
-          for (int p = 0; p < cc->nranks; ++p) {
-            if (cc->peers[p]->fd == fd) cc->peers[p]->fd = -1;
-          }
+        if (read_all(fd, recv_stage, h.size) != 0) {
+          WARN("recv_thread[nic=%d]: read payload failed", nic_idx);
+          forget_fd();
           continue;
         }
       }
-      // Find which peer this fd belongs to (so OP_GET handlers know who to reply to).
       int src_rank = -1;
       for (int p = 0; p < cc->nranks; ++p) {
-        if (cc->peers[p] && cc->peers[p]->fd == fd) { src_rank = p; break; }
+        if (cc->peers[p] && cc->peers[p]->fds[nic_idx] == fd) { src_rank = p; break; }
       }
-      apply_recv(cc, h, cc->recv_stage, src_rank);
+      apply_recv(cc, h, recv_stage, src_rank);
     }
   }
 }
@@ -590,12 +613,42 @@ static ncclResult_t gin_init(void** ctx, uint64_t commId,
   std::lock_guard<std::mutex> g(g_plugin_mu);
   if (!g_plugin) {
     g_plugin = new PluginCtx;
-    g_plugin->iface = env_or("NCCL_SOCKET_IFNAME", "eth0");
-    g_plugin->local_ip = resolve_local_ip(g_plugin->iface);
-    char buf[64];
-    inet_ntop(AF_INET, &g_plugin->local_ip, buf, sizeof(buf));
-    INFO("gin_init: iface=%s local_ip=%s commId=%lu",
-         g_plugin->iface.c_str(), buf, (unsigned long)commId);
+    // NCCL_SOCKET_IFNAMES (plural) > NCCL_SOCKET_IFNAME (singular) > "eth0".
+    // Comma-separated list, e.g. "eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8".
+    std::string list = env_or("NCCL_SOCKET_IFNAMES", "");
+    if (list.empty()) list = env_or("NCCL_SOCKET_IFNAME", "eth0");
+    size_t start = 0;
+    while (start < list.size() && (int)g_plugin->ifaces.size() < kMaxNics) {
+      size_t comma = list.find(',', start);
+      std::string name = list.substr(start, comma == std::string::npos
+                                                ? std::string::npos
+                                                : comma - start);
+      // Trim whitespace.
+      while (!name.empty() && std::isspace((unsigned char)name.front())) name.erase(0, 1);
+      while (!name.empty() && std::isspace((unsigned char)name.back())) name.pop_back();
+      if (!name.empty()) {
+        in_addr_t ip = resolve_local_ip(name);
+        if (ip != 0) {
+          g_plugin->ifaces.push_back(name);
+          g_plugin->local_ips.push_back(ip);
+        } else {
+          WARN("gin_init: could not resolve iface '%s', skipping", name.c_str());
+        }
+      }
+      if (comma == std::string::npos) break;
+      start = comma + 1;
+    }
+    if (g_plugin->ifaces.empty()) {
+      WARN("gin_init: no usable interfaces from NCCL_SOCKET_IFNAME(S); fallback eth0");
+      g_plugin->ifaces.push_back("eth0");
+      g_plugin->local_ips.push_back(resolve_local_ip("eth0"));
+    }
+    for (size_t i = 0; i < g_plugin->ifaces.size(); ++i) {
+      char buf[64];
+      inet_ntop(AF_INET, &g_plugin->local_ips[i], buf, sizeof(buf));
+      INFO("gin_init: iface[%zu]=%s local_ip=%s commId=%lu",
+           i, g_plugin->ifaces[i].c_str(), buf, (unsigned long)commId);
+    }
   }
   g_plugin->commId = commId;
   g_plugin->initialized.store(true);
@@ -642,43 +695,60 @@ static ncclResult_t gin_listen(void* /*ctx*/, int dev, void* opaqueHandle,
                                void** listenComm) {
   auto* h = reinterpret_cast<ListenHandleV1*>(opaqueHandle);
   std::memset(h, 0, sizeof(*h));
-  h->magic = WIRE_MAGIC;
-  // Create listen socket
-  int s = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (s < 0) {
-    WARN("gin_listen: socket() failed: %s", std::strerror(errno));
-    return ncclSystemError;
-  }
-  int one = 1;
-  ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  set_socket_bufs(s);
-  sockaddr_in sa{};
-  sa.sin_family = AF_INET;
-  sa.sin_addr.s_addr = g_plugin ? g_plugin->local_ip : INADDR_ANY;
-  sa.sin_port = 0;
-  if (::bind(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-    WARN("gin_listen: bind() failed: %s", std::strerror(errno));
-    ::close(s);
-    return ncclSystemError;
-  }
-  if (::listen(s, 64) != 0) {
-    WARN("gin_listen: listen() failed: %s", std::strerror(errno));
-    ::close(s);
-    return ncclSystemError;
-  }
-  sockaddr_in bound{};
-  socklen_t bl = sizeof(bound);
-  ::getsockname(s, reinterpret_cast<sockaddr*>(&bound), &bl);
-  h->ip = bound.sin_addr.s_addr;
-  h->port = bound.sin_port;
+  h->magic = HANDLE_MAGIC_V2;
   auto* lc = new ListenComm;
-  lc->fd = s;
   lc->dev = dev;
+
+  int n_nics = g_plugin ? (int)g_plugin->ifaces.size() : 1;
+  if (n_nics < 1) n_nics = 1;
+  if (n_nics > kMaxNics) n_nics = kMaxNics;
+  h->n_nics = n_nics;
+
+  for (int i = 0; i < n_nics; ++i) {
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+      WARN("gin_listen: socket(nic=%d) failed: %s", i, std::strerror(errno));
+      for (int j = 0; j < i; ++j) ::close(lc->fds[j]);
+      delete lc;
+      return ncclSystemError;
+    }
+    int one = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    set_socket_bufs(s);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = g_plugin ? g_plugin->local_ips[i] : INADDR_ANY;
+    sa.sin_port = 0;
+    if (::bind(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+      WARN("gin_listen: bind(nic=%d iface=%s) failed: %s", i,
+           g_plugin ? g_plugin->ifaces[i].c_str() : "?", std::strerror(errno));
+      ::close(s);
+      for (int j = 0; j < i; ++j) ::close(lc->fds[j]);
+      delete lc;
+      return ncclSystemError;
+    }
+    if (::listen(s, 64) != 0) {
+      WARN("gin_listen: listen(nic=%d) failed: %s", i, std::strerror(errno));
+      ::close(s);
+      for (int j = 0; j < i; ++j) ::close(lc->fds[j]);
+      delete lc;
+      return ncclSystemError;
+    }
+    sockaddr_in bound{};
+    socklen_t bl = sizeof(bound);
+    ::getsockname(s, reinterpret_cast<sockaddr*>(&bound), &bl);
+    h->endpoints[i].ip = bound.sin_addr.s_addr;
+    h->endpoints[i].port = (uint32_t)bound.sin_port; // network-order uint16 in low bits
+    lc->fds[i] = s;
+    char ipbuf[64];
+    inet_ntop(AF_INET, &h->endpoints[i].ip, ipbuf, sizeof(ipbuf));
+    INFO("gin_listen: dev=%d nic=%d iface=%s bound=%s:%u", dev, i,
+         g_plugin ? g_plugin->ifaces[i].c_str() : "?", ipbuf,
+         ntohs((uint16_t)h->endpoints[i].port));
+  }
+  lc->n_nics = n_nics;
   *listenComm = lc;
-  char ipbuf[64];
-  inet_ntop(AF_INET, &h->ip, ipbuf, sizeof(ipbuf));
-  INFO("gin_listen: dev=%d bound=%s:%u listenComm=%p", dev, ipbuf,
-       ntohs(h->port), lc);
+  INFO("gin_listen: dev=%d n_nics=%d listenComm=%p", dev, n_nics, lc);
   return ncclSuccess;
 }
 
@@ -693,127 +763,160 @@ static ncclResult_t gin_connect(void* /*ctx*/, void* handles[], int nranks,
   cc->peers.reserve(nranks);
   for (int i = 0; i < nranks; ++i) cc->peers.emplace_back(new PeerLink());
 
-  // Validate handles
+  // Validate handles + agree on n_nics with all peers.
+  // We use min(local n_nics, all peers' n_nics) so heterogeneous nodes don't
+  // end up with mismatched sock counts.
+  int my_nics = lc->n_nics;
+  int n_nics = my_nics;
   for (int r = 0; r < nranks; ++r) {
     auto* h = reinterpret_cast<ListenHandleV1*>(handles[r]);
-    if (h->magic != WIRE_MAGIC) {
-      WARN("gin_connect: bad magic from rank %d", r);
+    if (h->magic != HANDLE_MAGIC_V2) {
+      WARN("gin_connect: bad magic 0x%x from rank %d (expected 0x%x)",
+           (unsigned)h->magic, r, (unsigned)HANDLE_MAGIC_V2);
       delete cc;
       return ncclInternalError;
     }
+    int peer_nics = (int)h->n_nics;
+    if (peer_nics < 1 || peer_nics > kMaxNics) {
+      WARN("gin_connect: rank %d advertised invalid n_nics=%d", r, peer_nics);
+      delete cc;
+      return ncclInternalError;
+    }
+    if (peer_nics < n_nics) n_nics = peer_nics;
   }
+  cc->n_nics = n_nics;
+  INFO("gin_connect: agreed n_nics=%d (mine=%d)", n_nics, my_nics);
 
-  // For each peer != self:
-  //   if peer < self: we connect to peer (peer accepts).
+  // For each (peer, nic) with peer != self:
+  //   if peer < self: we connect to peer's nic (peer accepts).
   //   if peer > self: peer connects to us, we accept.
-  int expected_accepts = nranks - 1 - rank; // count of peers > rank
+  int expected_accepts = (nranks - 1 - rank) * n_nics;
   int connects_done = 0, accepts_done = 0;
 
-  for (int peer = 0; peer < nranks; ++peer) {
-    if (peer == rank) continue;
-    if (peer >= rank) continue; // only do connects in pass 1
+  for (int peer = 0; peer < rank; ++peer) {
     auto* h = reinterpret_cast<ListenHandleV1*>(handles[peer]);
-    sockaddr_in pa{};
-    pa.sin_family = AF_INET;
-    pa.sin_addr.s_addr = h->ip;
-    pa.sin_port = h->port;
-    int s = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) {
-      WARN("gin_connect: socket() failed: %s", std::strerror(errno));
-      delete cc;
-      return ncclSystemError;
-    }
-    set_socket_bufs(s);
-    // retry connect a few times in case peer not yet listening
-    int attempts = 0;
-    while (true) {
-      if (::connect(s, reinterpret_cast<sockaddr*>(&pa), sizeof(pa)) == 0)
-        break;
-      if (++attempts > 100) {
-        WARN("gin_connect: connect to rank %d failed: %s", peer,
+    for (int nic = 0; nic < n_nics; ++nic) {
+      sockaddr_in pa{};
+      pa.sin_family = AF_INET;
+      pa.sin_addr.s_addr = h->endpoints[nic].ip;
+      pa.sin_port = (uint16_t)h->endpoints[nic].port;
+      int s = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (s < 0) {
+        WARN("gin_connect: socket(peer=%d nic=%d) failed: %s", peer, nic,
              std::strerror(errno));
+        delete cc;
+        return ncclSystemError;
+      }
+      set_socket_bufs(s);
+      int attempts = 0;
+      while (true) {
+        if (::connect(s, reinterpret_cast<sockaddr*>(&pa), sizeof(pa)) == 0)
+          break;
+        if (++attempts > 100) {
+          WARN("gin_connect: connect peer=%d nic=%d failed: %s", peer, nic,
+               std::strerror(errno));
+          ::close(s);
+          delete cc;
+          return ncclSystemError;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      // Handshake: send (my_rank, nic_idx) so peer knows where to slot us.
+      uint32_t hs[2] = { htonl((uint32_t)rank), htonl((uint32_t)nic) };
+      if (write_all(s, hs, sizeof(hs)) != 0) {
+        WARN("gin_connect: handshake write peer=%d nic=%d failed", peer, nic);
         ::close(s);
         delete cc;
         return ncclSystemError;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      cc->peers[peer]->fds[nic] = s;
+      connects_done++;
     }
-    // Send our rank so peer can route the accept.
-    uint32_t my_rank_be = htonl((uint32_t)rank);
-    if (write_all(s, &my_rank_be, sizeof(my_rank_be)) != 0) {
-      WARN("gin_connect: handshake write to rank %d failed", peer);
-      ::close(s);
-      delete cc;
-      return ncclSystemError;
-    }
-    cc->peers[peer]->fd = s;
-    connects_done++;
   }
 
-  // Accept pass: accept (nranks - 1 - rank) connections; each carries 4B rank.
+  // Accept pass: accept on all our listen sockets in a round-robin way.
+  // Each incoming connection carries (remote_rank, nic_idx).
+  // Use poll() across all listen fds so we don't block on a single nic.
   while (accepts_done < expected_accepts) {
-    sockaddr_in pa{};
-    socklen_t pl = sizeof(pa);
-    int s = ::accept(lc->fd, reinterpret_cast<sockaddr*>(&pa), &pl);
-    if (s < 0) {
-      WARN("gin_connect: accept() failed: %s", std::strerror(errno));
+    std::vector<pollfd> lpfds;
+    lpfds.reserve(n_nics);
+    for (int nic = 0; nic < n_nics; ++nic) {
+      pollfd p = {lc->fds[nic], POLLIN, 0};
+      lpfds.push_back(p);
+    }
+    int rc = ::poll(lpfds.data(), lpfds.size(), 30000);
+    if (rc <= 0) {
+      WARN("gin_connect: poll(listen) failed/timeout rc=%d expected=%d done=%d",
+           rc, expected_accepts, accepts_done);
       delete cc;
       return ncclSystemError;
     }
-    set_socket_bufs(s);
-    uint32_t remote_rank_be = 0;
-    if (read_all(s, &remote_rank_be, sizeof(remote_rank_be)) != 0) {
-      WARN("gin_connect: handshake read failed");
-      ::close(s);
-      continue; // try next accept
+    for (int nic = 0; nic < n_nics; ++nic) {
+      if (!(lpfds[nic].revents & POLLIN)) continue;
+      sockaddr_in pa{};
+      socklen_t pl = sizeof(pa);
+      int s = ::accept(lc->fds[nic], reinterpret_cast<sockaddr*>(&pa), &pl);
+      if (s < 0) {
+        WARN("gin_connect: accept(nic=%d) failed: %s", nic,
+             std::strerror(errno));
+        delete cc;
+        return ncclSystemError;
+      }
+      set_socket_bufs(s);
+      uint32_t hs[2] = {0, 0};
+      if (read_all(s, hs, sizeof(hs)) != 0) {
+        WARN("gin_connect: handshake read (nic=%d) failed", nic);
+        ::close(s);
+        continue;
+      }
+      int remote_rank = (int)ntohl(hs[0]);
+      int remote_nic = (int)ntohl(hs[1]);
+      if (remote_rank < 0 || remote_rank >= nranks || remote_rank == rank ||
+          remote_nic != nic) {
+        WARN("gin_connect: bad handshake rank=%d nic=%d (got nic on local=%d)",
+             remote_rank, remote_nic, nic);
+        ::close(s);
+        continue;
+      }
+      if (cc->peers[remote_rank]->fds[nic] >= 0) {
+        WARN("gin_connect: duplicate accept rank=%d nic=%d", remote_rank, nic);
+        ::close(s);
+        continue;
+      }
+      cc->peers[remote_rank]->fds[nic] = s;
+      accepts_done++;
     }
-    int remote_rank = (int)ntohl(remote_rank_be);
-    if (remote_rank < 0 || remote_rank >= nranks || remote_rank == rank) {
-      WARN("gin_connect: bad remote rank %d", remote_rank);
-      ::close(s);
-      continue;
-    }
-    if (cc->peers[remote_rank]->fd >= 0) {
-      WARN("gin_connect: duplicate accept from rank %d", remote_rank);
-      ::close(s);
-      continue;
-    }
-    cc->peers[remote_rank]->fd = s;
-    accepts_done++;
   }
 
-  // Set up recv thread + staging.
-  if (::pipe(cc->wakeup_pipe) != 0) {
-    WARN("gin_connect: pipe() failed: %s", std::strerror(errno));
-    delete cc;
-    return ncclSystemError;
-  }
-  // Make wakeup-read non-blocking so we can drain.
-  int fl = fcntl(cc->wakeup_pipe[0], F_GETFL, 0);
-  fcntl(cc->wakeup_pipe[0], F_SETFL, fl | O_NONBLOCK);
+  // Set up per-NIC recv threads, wakeup pipes, and staging buffers.
+  for (int nic = 0; nic < n_nics; ++nic) {
+    if (::pipe(cc->wakeup_pipes[nic]) != 0) {
+      WARN("gin_connect: pipe(nic=%d) failed: %s", nic, std::strerror(errno));
+      delete cc;
+      return ncclSystemError;
+    }
+    int fl = fcntl(cc->wakeup_pipes[nic][0], F_GETFL, 0);
+    fcntl(cc->wakeup_pipes[nic][0], F_SETFL, fl | O_NONBLOCK);
 
-  cudaError_t ce =
-      cudaMallocHost(&cc->recv_stage, cc->stage_bytes);
-  if (ce != cudaSuccess) {
-    WARN("gin_connect: cudaMallocHost(recv) failed: %s",
-         cudaGetErrorString(ce));
-    delete cc;
-    return ncclSystemError;
+    cudaError_t ce = cudaMallocHost(&cc->recv_stages[nic], cc->stage_bytes);
+    if (ce != cudaSuccess) {
+      WARN("gin_connect: cudaMallocHost(recv nic=%d) failed: %s", nic,
+           cudaGetErrorString(ce));
+      delete cc;
+      return ncclSystemError;
+    }
+    ce = cudaMallocHost(&cc->send_stages[nic], cc->stage_bytes);
+    if (ce != cudaSuccess) {
+      WARN("gin_connect: cudaMallocHost(send nic=%d) failed: %s", nic,
+           cudaGetErrorString(ce));
+      delete cc;
+      return ncclSystemError;
+    }
   }
-  ce = cudaMallocHost(&cc->send_stage, cc->stage_bytes);
-  if (ce != cudaSuccess) {
-    WARN("gin_connect: cudaMallocHost(send) failed: %s",
-         cudaGetErrorString(ce));
-    cudaFreeHost(cc->recv_stage);
-    delete cc;
-    return ncclSystemError;
-  }
-  ce = cudaMallocHost(&cc->signal_scratch, 16);
+  cudaError_t ce = cudaMallocHost(&cc->signal_scratch, 16);
   if (ce != cudaSuccess) {
     WARN("gin_connect: cudaMallocHost(scratch) failed: %s",
          cudaGetErrorString(ce));
-    cudaFreeHost(cc->recv_stage);
-    cudaFreeHost(cc->send_stage);
     delete cc;
     return ncclSystemError;
   }
@@ -823,9 +926,6 @@ static ncclResult_t gin_connect(void* /*ctx*/, void* handles[], int nranks,
   if (ce != cudaSuccess) {
     WARN("gin_connect: cudaStreamCreateWithFlags failed: %s",
          cudaGetErrorString(ce));
-    cudaFreeHost(cc->signal_scratch);
-    cudaFreeHost(cc->recv_stage);
-    cudaFreeHost(cc->send_stage);
     delete cc;
     return ncclSystemError;
   }
@@ -840,11 +940,13 @@ static ncclResult_t gin_connect(void* /*ctx*/, void* handles[], int nranks,
          cc->diag_dev_buf);
   }
   cc->running.store(true, std::memory_order_release);
-  cc->recv_thread = std::thread(recv_thread_fn, cc);
+  for (int nic = 0; nic < n_nics; ++nic) {
+    cc->recv_threads[nic] = std::thread(recv_thread_fn, cc, nic);
+  }
 
   *collComm = cc;
-  INFO("gin_connect: rank=%d/%d cc=%p connects=%d accepts=%d",
-       rank, nranks, cc, connects_done, accepts_done);
+  INFO("gin_connect: rank=%d/%d cc=%p n_nics=%d connects=%d accepts=%d",
+       rank, nranks, cc, n_nics, connects_done, accepts_done);
   return ncclSuccess;
 }
 
@@ -995,23 +1097,32 @@ static ncclResult_t gin_closeColl(void* collComm) {
   auto* cc = reinterpret_cast<CollComm*>(collComm);
   if (!cc) return ncclSuccess;
   cc->running.store(false, std::memory_order_release);
-  if (cc->wakeup_pipe[1] >= 0) {
-    char b = 1;
-    (void)::write(cc->wakeup_pipe[1], &b, 1);
+  for (int nic = 0; nic < cc->n_nics; ++nic) {
+    if (cc->wakeup_pipes[nic][1] >= 0) {
+      char b = 1;
+      (void)::write(cc->wakeup_pipes[nic][1], &b, 1);
+    }
   }
-  if (cc->recv_thread.joinable()) cc->recv_thread.join();
+  for (int nic = 0; nic < cc->n_nics; ++nic) {
+    if (cc->recv_threads[nic].joinable()) cc->recv_threads[nic].join();
+  }
   for (auto& pl : cc->peers) {
-    if (pl && pl->fd >= 0) ::close(pl->fd);
+    if (!pl) continue;
+    for (int nic = 0; nic < kMaxNics; ++nic) {
+      if (pl->fds[nic] >= 0) { ::close(pl->fds[nic]); pl->fds[nic] = -1; }
+    }
   }
-  if (cc->wakeup_pipe[0] >= 0) ::close(cc->wakeup_pipe[0]);
-  if (cc->wakeup_pipe[1] >= 0) ::close(cc->wakeup_pipe[1]);
-  if (cc->recv_stage) cudaFreeHost(cc->recv_stage);
-  if (cc->send_stage) cudaFreeHost(cc->send_stage);
+  for (int nic = 0; nic < kMaxNics; ++nic) {
+    if (cc->wakeup_pipes[nic][0] >= 0) ::close(cc->wakeup_pipes[nic][0]);
+    if (cc->wakeup_pipes[nic][1] >= 0) ::close(cc->wakeup_pipes[nic][1]);
+    if (cc->recv_stages[nic]) cudaFreeHost(cc->recv_stages[nic]);
+    if (cc->send_stages[nic]) cudaFreeHost(cc->send_stages[nic]);
+  }
   if (cc->signal_scratch) cudaFreeHost(cc->signal_scratch);
   if (cc->signal_stream) cudaStreamDestroy(cc->signal_stream);
   if (cc->diag_dev_buf) cudaFree(cc->diag_dev_buf);
   for (auto* m : cc->mrs) if (m) delete m;
-  INFO("gin_closeColl: %p (mrs=%zu)", cc, cc->mrs.size());
+  INFO("gin_closeColl: %p (mrs=%zu n_nics=%d)", cc, cc->mrs.size(), cc->n_nics);
   delete cc;
   return ncclSuccess;
 }
@@ -1019,7 +1130,9 @@ static ncclResult_t gin_closeColl(void* collComm) {
 static ncclResult_t gin_closeListen(void* listenComm) {
   auto* lc = reinterpret_cast<ListenComm*>(listenComm);
   if (!lc) return ncclSuccess;
-  if (lc->fd >= 0) ::close(lc->fd);
+  for (int nic = 0; nic < kMaxNics; ++nic) {
+    if (lc->fds[nic] >= 0) ::close(lc->fds[nic]);
+  }
   delete lc;
   return ncclSuccess;
 }
@@ -1059,26 +1172,34 @@ static ncclResult_t do_send(CollComm* cc, int dst_rank, const WireMsgHdr& h,
     WARN("do_send: invalid dst_rank=%d", dst_rank);
     return ncclInvalidArgument;
   }
+  // Pick a NIC by hashing on (dst_token, dst_off). Same target region
+  // always goes through the same NIC so ordering is preserved per-region
+  // even with concurrent recv_threads on different NICs.
+  int n_nics = cc->n_nics > 0 ? cc->n_nics : 1;
+  uint64_t mix = (h.dst_token * 0x9E3779B97F4A7C15ull) ^
+                 (h.dst_off * 0xC2B2AE3D27D4EB4Full);
+  int nic_idx = (int)(mix % (uint64_t)n_nics);
+
   // Self-send: skip the wire, apply directly in-process. Barrier kernels do
   // `for (i in 0..nranks) signal(team, i, ...)` which always includes self.
   if (dst_rank == cc->rank) {
-    // Stage CUDA payload into host buffer if needed (apply_recv expects host).
     const void* payload = src_addr;
     if (h.size > 0 && src_addr != nullptr && src_type == NCCL_PTR_CUDA) {
-      std::lock_guard<std::mutex> sg(cc->send_stage_mu);
+      std::lock_guard<std::mutex> sg(cc->send_stage_mus[nic_idx]);
+      void* stage = cc->send_stages[nic_idx];
       MrRecord* gm = find_mr_for_range(cc, src_addr, h.size);
       if (gm) {
         void* hm_off = static_cast<uint8_t*>(gm->gdr_host_map)
                        + gm->gdr_map_offset
                        + (static_cast<const uint8_t*>(src_addr)
                           - static_cast<uint8_t*>(gm->addr));
-        int rc = gdr_copy_from_mapping(gm->gdr_mh, cc->send_stage, hm_off, h.size);
+        int rc = gdr_copy_from_mapping(gm->gdr_mh, stage, hm_off, h.size);
         if (rc != 0) {
           WARN("do_send[self]: gdr_copy_from_mapping rc=%d", rc);
           return ncclSystemError;
         }
       } else {
-        cudaError_t ce = cudaMemcpyAsync(cc->send_stage, src_addr, h.size,
+        cudaError_t ce = cudaMemcpyAsync(stage, src_addr, h.size,
                                          cudaMemcpyDeviceToHost,
                                          cc->signal_stream);
         if (ce == cudaSuccess) ce = cudaStreamSynchronize(cc->signal_stream);
@@ -1088,7 +1209,7 @@ static ncclResult_t do_send(CollComm* cc, int dst_rank, const WireMsgHdr& h,
           return ncclSystemError;
         }
       }
-      payload = cc->send_stage;
+      payload = stage;
       if (apply_recv(cc, h, payload, cc->rank) != 0) return ncclInternalError;
     } else {
       if (apply_recv(cc, h, payload, cc->rank) != 0) return ncclInternalError;
@@ -1101,12 +1222,14 @@ static ncclResult_t do_send(CollComm* cc, int dst_rank, const WireMsgHdr& h,
     return ncclInvalidUsage;
   }
   PeerLink& pl = *cc->peers[dst_rank];
-  if (pl.fd < 0) {
-    WARN("do_send: no link to rank %d", dst_rank);
+  int fd = pl.fds[nic_idx];
+  if (fd < 0) {
+    WARN("do_send: no link to rank %d nic %d", dst_rank, nic_idx);
     return ncclInternalError;
   }
-  std::lock_guard<std::mutex> g(pl.send_mu);
-  std::lock_guard<std::mutex> sg(cc->send_stage_mu);
+  std::lock_guard<std::mutex> g(pl.send_mus[nic_idx]);
+  std::lock_guard<std::mutex> sg(cc->send_stage_mus[nic_idx]);
+  void* stage = cc->send_stages[nic_idx];
 
   // Stage payload (CUDA → host) if needed. size=0 is a valid signal-only op.
   const void* payload = src_addr;
@@ -1117,40 +1240,39 @@ static ncclResult_t do_send(CollComm* cc, int dst_rank, const WireMsgHdr& h,
                      + gm->gdr_map_offset
                      + (static_cast<const uint8_t*>(src_addr)
                         - static_cast<uint8_t*>(gm->addr));
-      int rc = gdr_copy_from_mapping(gm->gdr_mh, cc->send_stage, hm_off, h.size);
+      int rc = gdr_copy_from_mapping(gm->gdr_mh, stage, hm_off, h.size);
       if (rc != 0) {
         WARN("do_send[cross]: gdr_copy_from_mapping rc=%d", rc);
         return ncclSystemError;
       }
-      payload = cc->send_stage;
+      payload = stage;
     } else {
-    cudaError_t ce = cudaMemcpyAsync(cc->send_stage, src_addr, h.size,
-                                     cudaMemcpyDeviceToHost,
-                                     cc->signal_stream);
-    if (ce == cudaSuccess) ce = cudaStreamSynchronize(cc->signal_stream);
-    if (ce != cudaSuccess) {
-      WARN("do_send: cudaMemcpyAsync D→H failed: %s", cudaGetErrorString(ce));
-      return ncclSystemError;
+      cudaError_t ce = cudaMemcpyAsync(stage, src_addr, h.size,
+                                       cudaMemcpyDeviceToHost,
+                                       cc->signal_stream);
+      if (ce == cudaSuccess) ce = cudaStreamSynchronize(cc->signal_stream);
+      if (ce != cudaSuccess) {
+        WARN("do_send: cudaMemcpyAsync D→H failed: %s", cudaGetErrorString(ce));
+        return ncclSystemError;
+      }
+      payload = stage;
     }
-    payload = cc->send_stage;
-    }  // close else (non-GDR path)
   }
 
-  if (write_all(pl.fd, &h, sizeof(h)) != 0) {
-    WARN("do_send: write hdr failed to rank %d: %s", dst_rank,
+  if (write_all(fd, &h, sizeof(h)) != 0) {
+    WARN("do_send: write hdr failed to rank %d nic %d: %s", dst_rank, nic_idx,
          std::strerror(errno));
     return ncclSystemError;
   }
-  // OP_GET is hdr-only (request to be fulfilled remotely with a PUT reply).
   if (h.size > 0 && h.op != OP_GET) {
-    if (write_all(pl.fd, payload, h.size) != 0) {
-      WARN("do_send: write payload failed to rank %d: %s", dst_rank,
-           std::strerror(errno));
+    if (write_all(fd, payload, h.size) != 0) {
+      WARN("do_send: write payload failed to rank %d nic %d: %s", dst_rank,
+           nic_idx, std::strerror(errno));
       return ncclSystemError;
     }
   }
-  INFO("PATHB do_send[cross]: TCP wrote hdr+%lu payload bytes to rank=%d ok",
-       (unsigned long)h.size, dst_rank);
+  INFO("PATHB do_send[cross]: TCP wrote hdr+%lu payload bytes to rank=%d nic=%d ok",
+       (unsigned long)h.size, dst_rank, nic_idx);
   return ncclSuccess;
 }
 
@@ -1450,13 +1572,15 @@ static ncclResult_t gin_v13_iget(void* ginCtx, int context,
     void* dst_addr = static_cast<uint8_t*>(dstMr->addr) + localOff;
     if (dstMr->gdr_pinned && srcMr->gdr_pinned && g_plugin && g_plugin->gdr) {
       // Stage src GPU mem → host via gdr_copy_from_mapping, then host → dst GPU.
-      std::lock_guard<std::mutex> sg(cc->send_stage_mu);
+      // Use NIC 0's stage for the self path — same-rank, no wire contention.
+      std::lock_guard<std::mutex> sg(cc->send_stage_mus[0]);
+      void* stage = cc->send_stages[0];
       void* hm_src = static_cast<uint8_t*>(srcMr->gdr_host_map)
                      + srcMr->gdr_map_offset + remoteOff;
       void* hm_dst = static_cast<uint8_t*>(dstMr->gdr_host_map)
                      + dstMr->gdr_map_offset + localOff;
-      int rc = gdr_copy_from_mapping(srcMr->gdr_mh, cc->send_stage, hm_src, size);
-      if (rc == 0) rc = gdr_copy_to_mapping(dstMr->gdr_mh, hm_dst, cc->send_stage, size);
+      int rc = gdr_copy_from_mapping(srcMr->gdr_mh, stage, hm_src, size);
+      if (rc == 0) rc = gdr_copy_to_mapping(dstMr->gdr_mh, hm_dst, stage, size);
       if (rc != 0) { WARN("gin_v13_iget[self]: gdr copy rc=%d", rc); r->done.store(1); return ncclInternalError; }
     } else {
       WARN("gin_v13_iget[self]: non-GDR fallback not implemented");

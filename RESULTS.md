@@ -218,19 +218,42 @@ Switching `NCCL_SOCKET_IFNAME` from eth0 to eth1 made **no measurable throughput
 
 Real upgrade path is **libfastrak (TCPXO GPU-direct)** — same data plane production NCCL uses for 227 GB/s busbw on a3-mega. That is a multi-week rewrite of the data plane, not patches to the current plugin. An interim step that stays inside the current TCP+GDRCopy architecture is sharding traffic across `eth1`..`eth8` with one `recv_thread` per NIC (theoretical ~8× headroom, in practice gated by GDRCopy serialisation and per-peer dependencies — see "Recv optimisation paths" below).
 
-### Recv optimisation paths (incremental, no fabric change)
+### Recv optimisation: multi-NIC sharding (implemented, measured)
 
-Ordered roughly by expected payoff at large message sizes:
+The plugin now supports `NCCL_SOCKET_IFNAMES=eth1,eth2,...,eth8` and opens one TCP connection per `(peer, NIC)`, with one `recv_thread` per NIC and per-NIC staging buffers. NIC selection is `hash(dst_token, dst_off) % n_nics`, so the same target region always lands on the same NIC (preserves per-region ordering).
 
-1. **Shard connections across eth1..eth8** + one `recv_thread` per NIC. Hash on `(src_rank, dst_token)` or pin a peer to a NIC. Theoretical 8× recv throughput (each GPUDirect NIC is its own 25-Gbps pipe); real gain limited by the `apply_recv` critical section and by GDRCopy throughput.
-2. **Per-peer `recv_thread`** even on the same NIC: removes the head-of-line block where a slow peer's `apply_recv` stalls the others.
-3. **`recvmmsg` / `sendmmsg` batching** when there are queued GFDs for the same peer: one syscall per N small messages instead of N syscalls.
-4. **Coalesce per-op `WireMsgHdr`** for back-to-back ops to the same destination, so a 4 KB op stops paying 68 bytes (~1.6%) of header overhead and one full syscall round-trip.
-5. **Replace `poll()` with `epoll(7)` (or `io_uring`)** in `recv_thread`; once there are 8+ peers the `poll()` scan dominates wake-up cost.
-6. **TCP socket tuning** (`TCP_NODELAY`, larger `SO_SNDBUF/SO_RCVBUF`, BBR). Already partly on by default in NGC kernels, but worth measuring.
-7. **GDRCopy persistent mapping reuse**: amortise `gdr_pin_buffer` cost across the lifetime of an MR (we already do this); revisit if the test ever creates short-lived MRs.
+**Measured on `test_pp` 2 × 1, recv peak GB/s at hide=1, concurrent=3:**
 
-`libfastrak` remains the only path to >>10 GB/s; the items above are bounded by ~10–20 GB/s aggregate even when stacked.
+| message size | 1 NIC | 4 NICs (eth1×4 same NIC) | 8 NICs (eth1..eth8) |
+|---:|---:|---:|---:|
+|   4 KB | 0.20 | — | 0.158 |
+|  16 KB | 0.45 | — | 0.430 |
+|  64 KB | 0.67 | — | 0.646 |
+| 256 KB | 0.70 | — | 0.679 |
+|   1 MB | **1.11** | **1.107** | **1.026** |
+
+**Result on this micro-benchmark: no gain.** Both same-NIC multi-stream and 8-NIC sharding land at the same ~1.1 GB/s ceiling. So the cap is *not* per-TCP-stream and *not* per-NIC — it sits above the transport layer. Diagnosis:
+
+- A 2-rank × 1-process test has exactly one peer. With `inflight=3`, at most 3 distinct `(dst_token, dst_off)` regions exist in flight → at most 3 of the 8 NICs ever carry a packet.
+- The `test_pp` pipeline pattern is fundamentally round-trip: each iter has to wait for the inflight tensor's signal to come back before issuing the next, so the latency floor (GDRCopy + TCP + signal RMW ≈ 300–800 µs per RTT depending on size) sets the throughput ceiling, not the link.
+- Same-NIC × 4 streams returns the same number (1.107 GB/s), confirming we are *not* hitting a per-stream TCP cap.
+
+**Where multi-NIC sharding is expected to pay off**, given the same code with no further changes:
+- larger `world_size` (more peer pairs in flight → more distinct hash buckets → real NIC parallelism);
+- `test_ep` dispatch / combine traffic, where each iter fans tokens out to all experts (lots of distinct `(dst_token, dst_off)` keys);
+- multi-process per node (`N_LOCAL > 1`), which simultaneously increases concurrent peers.
+
+These haven't been re-measured yet on the current cluster — the infra is in place, validation needs a larger test setup than 2 × 1.
+
+### Other recv optimisation paths still on the table
+
+1. **Per-peer `recv_thread`** even on the same NIC: removes the head-of-line block where a slow peer's `apply_recv` stalls the others. Not implemented.
+2. **`recvmmsg` / `sendmmsg` batching** when there are queued GFDs for the same peer: one syscall per N small messages instead of N syscalls.
+3. **Coalesce per-op `WireMsgHdr`** for back-to-back ops to the same destination, so a 4 KB op stops paying 68 bytes (~1.6%) of header overhead and one full syscall round-trip.
+4. **`epoll(7)` or `io_uring`** to replace the per-iter `poll()` scan; once there are 16+ peers the scan dominates wake-up cost.
+5. **TCP socket tuning** (`TCP_NODELAY`, larger `SO_SNDBUF/SO_RCVBUF`, BBR). Already partly on by default in NGC kernels.
+
+For the specific bottleneck visible at 2 × 1 micro-benchmark scale (DeepEP-side pipeline RTT, not transport), none of the above will move the number. `libfastrak` remains the only path to >>10 GB/s, but at any larger world size multi-NIC sharding alone should start to pay.
 
 ---
 
