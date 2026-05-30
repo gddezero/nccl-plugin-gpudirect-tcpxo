@@ -243,7 +243,32 @@ The plugin now supports `NCCL_SOCKET_IFNAMES=eth1,eth2,...,eth8` and opens one T
 - `test_ep` dispatch / combine traffic, where each iter fans tokens out to all experts (lots of distinct `(dst_token, dst_off)` keys);
 - multi-process per node (`N_LOCAL > 1`), which simultaneously increases concurrent peers.
 
-These haven't been re-measured yet on the current cluster — the infra is in place, validation needs a larger test setup than 2 × 1.
+### N_LOCAL=2 measurement — uncovered a hash-collision bug
+
+Ran `test_pp` with `N_LOCAL=2` (4 ranks total, 2 procs per node), 1 MB tensors:
+
+| config | recv peak GB/s (hide=1, c=3) |
+|---|---:|
+| N_LOCAL=1, 1 NIC  | 1.11 |
+| N_LOCAL=1, 8 NIC  | 1.026 |
+| N_LOCAL=2, 1 NIC  | 0.83 |
+| N_LOCAL=2, 8 NIC  | **0.90** (+8% over N_LOCAL=2/1-NIC) |
+
+Per-NIC `recv_thread` fire counts on rank 0 (8-NIC run) tell the real story:
+
+```
+recv_thread[nic=0]: 1477    ← carries traffic
+recv_thread[nic=4]: 1467    ← carries traffic
+recv_thread[nic=1,2,3,5,6,7]: 4 each   ← connect/finalize noise only
+```
+
+**Root cause: `hash(dst_token, dst_off) % n_nics` collides.** In `test_pp` the set of live `(dst_token, dst_off)` keys is tiny (≈ inflight × a few token slots), so the hash maps them onto only 2 of the 8 NICs. Six NICs sit idle. The theoretical ceiling for this run is therefore ~2× (not 8×), and DeepEP's own RTT pipeline cap eats most of that, leaving the measured +8%.
+
+**Fix candidates (next session):**
+- **A — mix `dst_rank` into the hash** (`mix ^= dst_rank * <odd const>`): one line, no ordering impact (same region on same rank still maps to same NIC), spreads across NICs as soon as there is >1 peer. Lowest risk; do this first.
+- **B — round-robin on a per-op counter (`req_id`)**: spreads perfectly but **breaks per-region ordering** (two PUTs to the same `(token, off)` could take different NICs and arrive out of order). Only safe if DeepEP never issues ordered same-region writes; needs verification before use.
+
+The infra is validated end-to-end at N_LOCAL=2 (no correctness regressions, all 8 recv_threads spawn and shut down cleanly); only the load-balancing hash needs improvement.
 
 ### Other recv optimisation paths still on the table
 
@@ -253,7 +278,7 @@ These haven't been re-measured yet on the current cluster — the infra is in pl
 4. **`epoll(7)` or `io_uring`** to replace the per-iter `poll()` scan; once there are 16+ peers the scan dominates wake-up cost.
 5. **TCP socket tuning** (`TCP_NODELAY`, larger `SO_SNDBUF/SO_RCVBUF`, BBR). Already partly on by default in NGC kernels.
 
-For the specific bottleneck visible at 2 × 1 micro-benchmark scale (DeepEP-side pipeline RTT, not transport), none of the above will move the number. `libfastrak` remains the only path to >>10 GB/s, but at any larger world size multi-NIC sharding alone should start to pay.
+For the specific bottleneck visible at 2 × 1 micro-benchmark scale (DeepEP-side pipeline RTT, not transport), none of the above will move the number. `libfastrak` remains the only path to >>10 GB/s, but at any larger world size multi-NIC sharding **plus the hash fix above** should start to pay.
 
 ---
 
