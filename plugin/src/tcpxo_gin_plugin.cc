@@ -1172,12 +1172,17 @@ static ncclResult_t do_send(CollComm* cc, int dst_rank, const WireMsgHdr& h,
     WARN("do_send: invalid dst_rank=%d", dst_rank);
     return ncclInvalidArgument;
   }
-  // Pick a NIC by hashing on (dst_token, dst_off). Same target region
-  // always goes through the same NIC so ordering is preserved per-region
-  // even with concurrent recv_threads on different NICs.
+  // Pick a NIC by hashing on (dst_token, dst_off, dst_rank). Same target
+  // region on the same rank always goes through the same NIC so per-region
+  // ordering is preserved (recv_threads run concurrently across NICs).
+  // dst_rank mixed in to break the hash collision RESULTS.md "Fix A" called
+  // out: in test_pp with tiny (token, off) key sets, the original 2-field
+  // hash mapped onto only 2/8 NICs (six idle). With dst_rank in the mix,
+  // as soon as world_size > 1 the keys spread across all NICs.
   int n_nics = cc->n_nics > 0 ? cc->n_nics : 1;
   uint64_t mix = (h.dst_token * 0x9E3779B97F4A7C15ull) ^
-                 (h.dst_off * 0xC2B2AE3D27D4EB4Full);
+                 (h.dst_off * 0xC2B2AE3D27D4EB4Full) ^
+                 ((uint64_t)dst_rank * 0xDEADBEEFCAFEBABEull);
   int nic_idx = (int)(mix % (uint64_t)n_nics);
 
   // Self-send: skip the wire, apply directly in-process. Barrier kernels do
